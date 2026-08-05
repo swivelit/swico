@@ -1,37 +1,43 @@
 # Validation record
 
-## Completed before packaging
+## Repository checks completed before packaging
 
-- `python3 -m py_compile train_vm.py`
-- `bash -n setup_vm.sh`
-- `bash -n run_vm_training.sh`
-- parsed the complete 90,162-row `data.csv`
-- removed repeated synthetic boilerplate and exact duplicate pairs
-- created component-isolated train, validation and test splits
-- confirmed zero exact normalized query, passage and component overlap between splits
-- exercised E5 formatting, trainer argument construction, final-layer freezing, Matryoshka dimensions, bounded retrieval metrics, NumPy exact-search fallback, hard-negative mining and hard-negative cache behavior with local test doubles
-- verified model-tree promotion using hard links with copy fallback
+- Python syntax compilation for `train_vm.py`, `training_config.py`, `verify_install.py` and tests
+- Bash syntax checks for `setup_vm.sh` and `run_vm_training.sh`
+- seven unit/source-contract tests passed
+- strict env-file parsing, shell override precedence, `auto` values, boolean parsing and unknown-key rejection tested
+- function-call keyword contracts checked through the Python AST
+- early-stopping callback, best-model arguments, epoch-aligned save/evaluation strategy and Transformers-v5 warmup compatibility checked in source contracts
+- all 90,162 source rows processed through the updated cleaning and component-isolated splitting path
+- resulting rows: train 45,012; validation 8,750; test 8,751
+- zero exact normalized query, passage and connected-component overlap verified across train, validation and test
+- simulated Transformers-5 argument construction selected float `warmup_steps`, epoch evaluation/saving and validation NDCG best-model selection
 
-## Resulting dataset audit
+## Installation-time checks included in the package
 
-- original rows: 90,162
-- cleaned unique pairs: 87,497
-- VM training rows: 45,012
-- validation rows: 8,750
-- test rows: 8,751
-- rows changed by repeated-boilerplate removal: 66,822
-- repeated sentences removed: 89,408
+`./setup_vm.sh` now performs the following after dependency installation:
+
+```bash
+python -m unittest discover -s tests -v
+python verify_install.py
+```
+
+`verify_install.py` instantiates the real installed `SentenceTransformerTrainingArguments`, checks the installed trainer's callback support, validates epoch-aligned evaluation and saving, confirms best-model loading and constructs `EarlyStoppingCallback` without downloading a model.
 
 ## Required VM validation
 
-A real end-to-end fine-tuning run was not executed in the packaging sandbox because the Sentence Transformers stack and base-model files were not available through that sandbox's package/model network. Run the included smoke profile on the target VM before the full VM profile:
+Run:
 
 ```bash
 SWICO_PROFILE=smoke ./run_vm_training.sh
 ```
 
-If CPU BF16 is rejected by an operation, rerun the smoke profile with:
+The user's previous v2.1.1 smoke run already established that this VM supports CPU BF16 and can train, evaluate, save and reload the E5 model. Version 3 changes configuration and stopping behavior, so one new smoke run is still required before starting the long VM profile.
+
+After the smoke test, inspect:
 
 ```bash
-SWICO_PROFILE=smoke ./run_vm_training.sh --no-bf16
+cat training_artifacts/e5-small-swico/reports/stage1.json
 ```
+
+For the one-epoch smoke profile, early stopping is configured but intentionally inactive because there is only one possible validation epoch. The full `vm` profile activates early stopping because its maximum epoch counts are greater than one.

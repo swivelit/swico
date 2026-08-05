@@ -3,25 +3,28 @@
 Swico CPU retrieval-model fine-tuning pipeline.
 
 Designed for a 4-physical-core / 8-logical-CPU VM with about 29 GiB RAM,
-no GPU, and constrained disk. It fine-tunes intfloat/multilingual-e5-small
+no GPU, and constrained compute. It fine-tunes intfloat/multilingual-e5-small
 for query-to-passage retrieval; it does not train a general-purpose LLM.
 
-Default VM profile:
-- leakage-resistant connected-component data split
+Version 3 capabilities:
+- typed training.env configuration with strict validation and CLI overrides
+- leakage-resistant connected-component data splitting
 - repeated-boilerplate removal and exact-pair deduplication
-- last-four-layer partial fine-tuning (lower layers and large embeddings frozen)
-- stage 1: in-batch-negative retrieval training
-- stage 2: guarded hard-negative curriculum
-- no-duplicate batches
-- Matryoshka dimensions 384 / 256 / 128
-- bounded IR evaluation, confidence calibration, latency report
-- one resumable checkpoint at a time
+- configurable partial encoder fine-tuning
+- stage 1 in-batch-negative retrieval training
+- stage 2 guarded hard-negative curriculum
+- no-duplicate batches and configurable Matryoshka loss
+- validation-driven early stopping with callback-state resume
+- automatic restoration of the best validation checkpoint
+- stage-1 versus stage-2 validation selection
+- bounded IR evaluation, confidence calibration and latency reporting
+- resumable, configuration-safe checkpoints and disk cleanup
 
 Examples:
-  python train_vm.py --profile smoke
-  python train_vm.py --profile vm --resume
-  python train_vm.py --profile full --resume
-  python train_vm.py --profile vm --prepare-only
+  ./run_vm_training.sh --print-config
+  SWICO_PROFILE=smoke ./run_vm_training.sh
+  ./run_vm_training.sh
+  ./run_vm_training.sh --env-file experiments/run-02.env
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ import gc
 import hashlib
 import inspect
 import json
+from importlib.metadata import PackageNotFoundError, version as package_version
 import logging
 import math
 import os
@@ -49,8 +53,32 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-# Configure CPU libraries before importing torch/numpy.
-_DEFAULT_THREADS = max(1, min(8, os.cpu_count() or 4))
+from packaging.version import Version
+
+from training_config import (
+    ConfigError,
+    env_bool,
+    env_float,
+    env_float_tuple,
+    env_int,
+    env_optional_bool,
+    env_optional_float,
+    env_optional_int,
+    env_optional_int_tuple,
+    env_optional_text,
+    env_text,
+    initialize_environment,
+)
+
+# Load the typed env file before importing torch/numpy so CPU library thread
+# settings are effective from process startup. Existing shell variables take
+# precedence over values in the file.
+try:
+    LOADED_ENV_FILE = initialize_environment(sys.argv[1:])
+except ConfigError as exc:
+    print(f"Configuration error: {exc}", file=sys.stderr)
+    raise SystemExit(2) from exc
+_DEFAULT_THREADS = max(1, min(env_int("SWICO_CPU_THREADS", 8), os.cpu_count() or 4))
 os.environ.setdefault("OMP_NUM_THREADS", str(_DEFAULT_THREADS))
 os.environ.setdefault("MKL_NUM_THREADS", str(_DEFAULT_THREADS))
 os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_DEFAULT_THREADS))
@@ -90,13 +118,14 @@ except ImportError:
     from sentence_transformers.losses import MatryoshkaLoss, MultipleNegativesRankingLoss
     from sentence_transformers.training_args import BatchSamplers
 
+from transformers import EarlyStoppingCallback
 from transformers.trainer_utils import get_last_checkpoint
 
 
 BASE_MODEL = "intfloat/multilingual-e5-small"
 QUERY_PREFIX = "query: "
 PASSAGE_PREFIX = "passage: "
-SCRIPT_VERSION = "2.1.1-cpu"
+SCRIPT_VERSION = "3.0.0-cpu-env-early-stop"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,8 +162,8 @@ PROFILES: dict[str, Profile] = {
     "vm": Profile(
         name="vm",
         max_train_rows=45_000,
-        stage1_epochs=1.0,
-        stage2_epochs=1.0,
+        stage1_epochs=5.0,
+        stage2_epochs=4.0,
         batch_size=64,
         max_seq_length=192,
         trainable_layers=4,
@@ -147,8 +176,8 @@ PROFILES: dict[str, Profile] = {
     "full": Profile(
         name="full",
         max_train_rows=None,
-        stage1_epochs=1.0,
-        stage2_epochs=1.0,
+        stage1_epochs=5.0,
+        stage2_epochs=4.0,
         batch_size=64,
         max_seq_length=192,
         trainable_layers=4,
@@ -202,39 +231,141 @@ class UnionFind:
         self.size[lroot] += self.size[rroot]
 
 
+def _path_from_env(name: str, default: str | None) -> Path | None:
+    value = env_optional_text(name)
+    if value is None:
+        return Path(default) if default is not None else None
+    return Path(value)
+
+
+def _parse_int_tuple(value: str) -> tuple[int, ...]:
+    try:
+        parsed = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected comma-separated integers") from exc
+    if not parsed:
+        raise argparse.ArgumentTypeError("at least one integer is required")
+    return parsed
+
+
+def _parse_float_tuple(value: str) -> tuple[float, ...]:
+    try:
+        parsed = tuple(float(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected comma-separated numbers") from exc
+    if not parsed:
+        raise argparse.ArgumentTypeError("at least one number is required")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="CPU-only fine-tuning for the Swico multilingual E5 retrieval model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--profile", choices=sorted(PROFILES), default="vm")
-    parser.add_argument("--data", type=Path, default=None, help="CSV file or ZIP containing a CSV")
-    parser.add_argument("--output", type=Path, default=Path("training_artifacts/e5-small-swico"))
-    parser.add_argument("--base-model", default=BASE_MODEL)
-    parser.add_argument("--threads", type=int, default=_DEFAULT_THREADS)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--boilerplate-threshold", type=int, default=100)
-    parser.add_argument("--max-train-rows", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--max-seq-length", type=int, default=None)
-    parser.add_argument("--trainable-layers", type=int, default=None)
-    parser.add_argument("--stage1-epochs", type=float, default=None)
-    parser.add_argument("--stage2-epochs", type=float, default=None)
-    parser.add_argument("--stage1-lr", type=float, default=2.0e-5)
-    parser.add_argument("--stage2-lr", type=float, default=8.0e-6)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-ratio", type=float, default=0.06)
-    parser.add_argument("--min-hard-negative-margin", type=float, default=0.02)
-    parser.add_argument("--hard-negatives", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--skip-base-eval", action="store_true")
-    parser.add_argument("--keep-intermediate", action="store_true")
-    parser.add_argument("--keep-checkpoints", action="store_true")
-    parser.add_argument("--overwrite-output", action="store_true")
-    parser.add_argument("--offline", action="store_true", help="Use only locally cached model files")
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=LOADED_ENV_FILE or Path("training.env"),
+        help="Typed env file loaded before command-line parsing",
+    )
+    parser.add_argument("--profile", choices=sorted(PROFILES), default=env_text("SWICO_PROFILE", "vm"))
+    parser.add_argument("--data", type=Path, default=_path_from_env("SWICO_DATA_PATH", None), help="CSV file or ZIP containing a CSV")
+    parser.add_argument("--output", type=Path, default=_path_from_env("SWICO_OUTPUT_DIR", "training_artifacts/e5-small-swico"))
+    parser.add_argument("--base-model", default=env_text("SWICO_BASE_MODEL", BASE_MODEL))
+    parser.add_argument("--threads", type=int, default=env_int("SWICO_CPU_THREADS", _DEFAULT_THREADS))
+    parser.add_argument("--seed", type=int, default=env_int("SWICO_SEED", 42))
+
+    parser.add_argument("--boilerplate-threshold", type=int, default=env_int("SWICO_BOILERPLATE_THRESHOLD", 100))
+    parser.add_argument("--max-train-rows", type=int, default=env_optional_int("SWICO_MAX_TRAIN_ROWS"))
+    parser.add_argument("--train-split-fraction", type=float, default=env_float("SWICO_TRAIN_SPLIT_FRACTION", 0.80))
+    parser.add_argument("--validation-split-fraction", type=float, default=env_float("SWICO_VALIDATION_SPLIT_FRACTION", 0.10))
+    parser.add_argument("--test-split-fraction", type=float, default=env_float("SWICO_TEST_SPLIT_FRACTION", 0.10))
+
+    parser.add_argument("--batch-size", type=int, default=env_optional_int("SWICO_BATCH_SIZE"))
+    parser.add_argument("--max-seq-length", type=int, default=env_optional_int("SWICO_MAX_SEQ_LENGTH"))
+    parser.add_argument("--trainable-layers", type=int, default=env_optional_int("SWICO_TRAINABLE_LAYERS"))
+    parser.add_argument("--stage1-epochs", type=float, default=env_optional_float("SWICO_STAGE1_EPOCHS"))
+    parser.add_argument("--stage2-epochs", type=float, default=env_optional_float("SWICO_STAGE2_EPOCHS"))
+    parser.add_argument("--stage1-lr", type=float, default=env_float("SWICO_STAGE1_LR", 2.0e-5))
+    parser.add_argument("--stage2-lr", type=float, default=env_float("SWICO_STAGE2_LR", 8.0e-6))
+    parser.add_argument("--weight-decay", type=float, default=env_float("SWICO_WEIGHT_DECAY", 0.01))
+    parser.add_argument("--warmup-ratio", type=float, default=env_float("SWICO_WARMUP_RATIO", 0.06))
+    parser.add_argument("--lr-scheduler-type", default=env_text("SWICO_LR_SCHEDULER_TYPE", "cosine"))
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=env_int("SWICO_GRADIENT_ACCUMULATION_STEPS", 1))
+    parser.add_argument("--max-grad-norm", type=float, default=env_float("SWICO_MAX_GRAD_NORM", 1.0))
+    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_GRADIENT_CHECKPOINTING", False))
+    parser.add_argument("--dataloader-num-workers", type=int, default=env_int("SWICO_DATALOADER_NUM_WORKERS", 0))
+    parser.add_argument("--dataloader-drop-last", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_DATALOADER_DROP_LAST", True))
+    parser.add_argument("--logging-steps", type=int, default=env_int("SWICO_LOGGING_STEPS", 25))
+    parser.add_argument("--save-total-limit", type=int, default=env_int("SWICO_SAVE_TOTAL_LIMIT", 2))
+
+    parser.add_argument("--eval-batch-size", type=int, default=env_int("SWICO_EVAL_BATCH_SIZE", 64))
+    parser.add_argument("--eval-loss-rows", type=int, default=env_int("SWICO_EVAL_LOSS_ROWS", 512))
+    parser.add_argument("--eval-corpus-chunk-size", type=int, default=env_int("SWICO_EVAL_CORPUS_CHUNK_SIZE", 5000))
+    parser.add_argument("--eval-queries", type=int, default=env_optional_int("SWICO_EVAL_QUERIES"))
+    parser.add_argument("--eval-corpus", type=int, default=env_optional_int("SWICO_EVAL_CORPUS"))
+
+    parser.add_argument("--hard-negatives", action=argparse.BooleanOptionalAction, default=env_optional_bool("SWICO_HARD_NEGATIVES"))
+    parser.add_argument("--mining-top-k", type=int, default=env_optional_int("SWICO_MINING_TOP_K"))
+    parser.add_argument("--min-hard-negative-margin", type=float, default=env_float("SWICO_MIN_HARD_NEGATIVE_MARGIN", 0.02))
+    parser.add_argument("--mining-batch-size", type=int, default=env_int("SWICO_MINING_BATCH_SIZE", 64))
+    parser.add_argument("--mining-chunk-size", type=int, default=env_int("SWICO_MINING_CHUNK_SIZE", 512))
+    parser.add_argument("--hnsw-m", type=int, default=env_int("SWICO_HNSW_M", 32))
+    parser.add_argument("--hnsw-ef-construction", type=int, default=env_int("SWICO_HNSW_EF_CONSTRUCTION", 80))
+    parser.add_argument("--hnsw-ef-search-factor", type=int, default=env_int("SWICO_HNSW_EF_SEARCH_FACTOR", 4))
+    parser.add_argument("--negative-max-token-jaccard", type=float, default=env_float("SWICO_NEGATIVE_MAX_TOKEN_JACCARD", 0.88))
+
+    parser.add_argument("--loss-scale", type=float, default=env_float("SWICO_LOSS_SCALE", 20.0))
+    parser.add_argument("--matryoshka-dims", type=_parse_int_tuple, default=env_optional_int_tuple("SWICO_MATRYOSHKA_DIMS"))
+    parser.add_argument("--matryoshka-weights", type=_parse_float_tuple, default=env_float_tuple("SWICO_MATRYOSHKA_WEIGHTS", (1.0, 0.35, 0.35)))
+    parser.add_argument("--matryoshka-dims-per-step", type=int, default=env_int("SWICO_MATRYOSHKA_DIMS_PER_STEP", -1))
+
+    parser.add_argument("--early-stopping", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_EARLY_STOPPING", True))
+    parser.add_argument("--early-stopping-patience", type=int, default=env_int("SWICO_EARLY_STOPPING_PATIENCE", 2))
+    parser.add_argument("--early-stopping-threshold", type=float, default=env_float("SWICO_EARLY_STOPPING_THRESHOLD", 0.001))
+    parser.add_argument("--load-best-model-at-end", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_LOAD_BEST_MODEL_AT_END", True))
+
+    parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=env_optional_bool("SWICO_BF16"))
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_RESUME", True))
+    parser.add_argument("--prepare-only", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_PREPARE_ONLY", False))
+    parser.add_argument("--skip-base-eval", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_SKIP_BASE_EVAL", False))
+    parser.add_argument("--keep-intermediate", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_KEEP_INTERMEDIATE", False))
+    parser.add_argument("--keep-checkpoints", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_KEEP_CHECKPOINTS", False))
+    parser.add_argument("--overwrite-output", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_OVERWRITE_OUTPUT", False))
+    parser.add_argument("--offline", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_OFFLINE", False), help="Use only locally cached model files")
+
+    parser.add_argument("--print-config", action="store_true", help="Validate and print the effective configuration without reading data or training")
+    parser.add_argument("--min-available-memory-gib", type=float, default=env_float("SWICO_MIN_AVAILABLE_MEMORY_GIB", 8.0))
+    parser.add_argument("--min-free-disk-gib", type=float, default=env_float("SWICO_MIN_FREE_DISK_GIB", 2.0))
+    parser.add_argument("--warn-free-disk-gib", type=float, default=env_float("SWICO_WARN_FREE_DISK_GIB", 4.0))
     return parser.parse_args()
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def effective_configuration_preview(args: argparse.Namespace, profile: Profile) -> dict[str, Any]:
+    return {
+        "script_version": SCRIPT_VERSION,
+        "env_file": str(LOADED_ENV_FILE) if LOADED_ENV_FILE else None,
+        "profile": dataclasses.asdict(profile),
+        "arguments": {
+            key: _json_safe(value)
+            for key, value in vars(args).items()
+            if key not in {"print_config"}
+        },
+        "precedence": ["command_line", "shell_environment", "env_file", "profile_defaults"],
+    }
 
 
 def configure_logging(output: Path) -> logging.Logger:
@@ -442,6 +573,7 @@ def prepare_dataset(
     boilerplate_threshold: int,
     seed: int,
     max_train_rows: int | None,
+    split_fractions: Mapping[str, float],
     logger: logging.Logger,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
     prepared_dir.mkdir(parents=True, exist_ok=True)
@@ -452,6 +584,7 @@ def prepare_dataset(
         "boilerplate_threshold": boilerplate_threshold,
         "seed": seed,
         "max_train_rows": max_train_rows,
+        "split_fractions": dict(split_fractions),
     }
     cache_meta_path = prepared_dir / "metadata.json"
     split_paths = {
@@ -497,7 +630,7 @@ def prepare_dataset(
     ]
     raw = assign_components(raw)
 
-    full_splits = component_split(raw, seed=seed)
+    full_splits = component_split(raw, seed=seed, fractions=split_fractions)
     full_train_rows = len(full_splits["train"])
     full_splits["train"] = sample_complete_components(full_splits["train"], max_train_rows, seed)
     overlaps = verify_split_isolation(full_splits)
@@ -539,7 +672,11 @@ def profile_with_overrides(args: argparse.Namespace) -> Profile:
         batch_size=args.batch_size if args.batch_size is not None else base.batch_size,
         max_seq_length=args.max_seq_length if args.max_seq_length is not None else base.max_seq_length,
         trainable_layers=args.trainable_layers if args.trainable_layers is not None else base.trainable_layers,
+        eval_queries=args.eval_queries if args.eval_queries is not None else base.eval_queries,
+        eval_corpus=args.eval_corpus if args.eval_corpus is not None else base.eval_corpus,
+        mining_top_k=args.mining_top_k if args.mining_top_k is not None else base.mining_top_k,
         hard_negatives=args.hard_negatives if args.hard_negatives is not None else base.hard_negatives,
+        matryoshka_dims=args.matryoshka_dims if args.matryoshka_dims is not None else base.matryoshka_dims,
     )
 
 
@@ -556,10 +693,63 @@ def validate_profile(profile: Profile, args: argparse.Namespace) -> None:
         raise ValueError("stage1_epochs must be positive and stage2_epochs cannot be negative")
     if args.stage1_lr <= 0 or args.stage2_lr <= 0:
         raise ValueError("learning rates must be positive")
+    if args.weight_decay < 0:
+        raise ValueError("weight_decay cannot be negative")
     if not 0.0 <= args.warmup_ratio < 1.0:
         raise ValueError("warmup_ratio must be in [0, 1)")
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    if args.max_grad_norm <= 0:
+        raise ValueError("max_grad_norm must be positive")
+    if args.dataloader_num_workers < 0:
+        raise ValueError("dataloader_num_workers cannot be negative")
+    if args.logging_steps < 1 or args.save_total_limit < 1:
+        raise ValueError("logging_steps and save_total_limit must be at least 1")
+    if args.eval_batch_size < 1 or args.eval_loss_rows < 1 or args.eval_corpus_chunk_size < 1:
+        raise ValueError("evaluation batch, loss-row, and corpus-chunk settings must be at least 1")
+    if profile.eval_queries < 1 or profile.eval_corpus < 2:
+        raise ValueError("eval_queries must be positive and eval_corpus must be at least 2")
+    if profile.mining_top_k < 2:
+        raise ValueError("mining_top_k must be at least 2")
     if args.min_hard_negative_margin < 0:
         raise ValueError("min_hard_negative_margin cannot be negative")
+    if args.mining_batch_size < 1 or args.mining_chunk_size < 1:
+        raise ValueError("mining batch and chunk sizes must be positive")
+    if args.hnsw_m < 2 or args.hnsw_ef_construction < 2 or args.hnsw_ef_search_factor < 1:
+        raise ValueError("HNSW settings are outside their safe ranges")
+    if not 0.0 <= args.negative_max_token_jaccard <= 1.0:
+        raise ValueError("negative_max_token_jaccard must be in [0, 1]")
+    if args.loss_scale <= 0:
+        raise ValueError("loss_scale must be positive")
+    if not profile.matryoshka_dims or any(value <= 0 for value in profile.matryoshka_dims):
+        raise ValueError("matryoshka_dims must contain positive dimensions")
+    if len(set(profile.matryoshka_dims)) != len(profile.matryoshka_dims):
+        raise ValueError("matryoshka_dims cannot contain duplicates")
+    if tuple(sorted(profile.matryoshka_dims, reverse=True)) != profile.matryoshka_dims:
+        raise ValueError("matryoshka_dims must be ordered from largest to smallest")
+    if len(args.matryoshka_weights) < len(profile.matryoshka_dims):
+        raise ValueError("matryoshka_weights must provide at least one weight per configured dimension")
+    if any(weight <= 0 for weight in args.matryoshka_weights[: len(profile.matryoshka_dims)]):
+        raise ValueError("matryoshka_weights must be positive")
+    if args.early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be at least 1")
+    if args.early_stopping_threshold < 0:
+        raise ValueError("early_stopping_threshold cannot be negative")
+    if args.early_stopping and not args.load_best_model_at_end:
+        raise ValueError("early stopping requires load_best_model_at_end=true")
+    fractions = (
+        args.train_split_fraction,
+        args.validation_split_fraction,
+        args.test_split_fraction,
+    )
+    if any(value <= 0 or value >= 1 for value in fractions):
+        raise ValueError("all split fractions must be between 0 and 1")
+    if not math.isclose(sum(fractions), 1.0, rel_tol=0, abs_tol=1e-9):
+        raise ValueError("train, validation, and test split fractions must sum to 1.0")
+    if args.min_available_memory_gib <= 0 or args.min_free_disk_gib <= 0:
+        raise ValueError("preflight memory and disk limits must be positive")
+    if args.warn_free_disk_gib < args.min_free_disk_gib:
+        raise ValueError("warn_free_disk_gib cannot be lower than min_free_disk_gib")
 
 
 def configure_runtime(threads: int, seed: int, logger: logging.Logger) -> int:
@@ -619,14 +809,30 @@ def system_report(output: Path, threads: int) -> dict[str, Any]:
     return report
 
 
-def preflight(report: Mapping[str, Any], logger: logging.Logger) -> None:
-    if float(report["memory_available_gib"]) < 8.0:
-        raise RuntimeError("At least 8 GiB available RAM is required for this CPU profile.")
+def preflight(
+    report: Mapping[str, Any],
+    min_available_memory_gib: float,
+    min_free_disk_gib: float,
+    warn_free_disk_gib: float,
+    logger: logging.Logger,
+) -> None:
+    available_memory = float(report["memory_available_gib"])
+    if available_memory < min_available_memory_gib:
+        raise RuntimeError(
+            f"Only {available_memory:.2f} GiB RAM is available; "
+            f"the configured minimum is {min_available_memory_gib:.2f} GiB."
+        )
     free_disk = float(report["disk_free_gib"])
-    if free_disk < 2.0:
-        raise RuntimeError("Less than 2 GiB disk is free. Free disk space before training.")
-    if free_disk < 4.0:
-        logger.warning("Only %.2f GiB disk is free. Keep-checkpoints and extra exports should remain disabled.", free_disk)
+    if free_disk < min_free_disk_gib:
+        raise RuntimeError(
+            f"Only {free_disk:.2f} GiB disk is free; "
+            f"the configured minimum is {min_free_disk_gib:.2f} GiB."
+        )
+    if free_disk < warn_free_disk_gib:
+        logger.warning(
+            "Only %.2f GiB disk is free. Keep-checkpoints and extra exports should remain disabled.",
+            free_disk,
+        )
     if not bool(report["cpu_has_avx2"]):
         logger.warning("AVX2 was not detected; CPU training will be substantially less efficient.")
 
@@ -738,6 +944,7 @@ def build_eval_bundle(
     max_corpus: int,
     seed: int,
     batch_size: int,
+    corpus_chunk_size: int,
     output_path: Path,
 ) -> EvalBundle:
     query_groups = [(query_norm, group) for query_norm, group in eval_frame.groupby("query_norm", sort=False)]
@@ -795,7 +1002,7 @@ def build_eval_bundle(
         queries=filtered_queries,
         corpus=corpus,
         relevant_docs=relevant_docs,
-        corpus_chunk_size=min(5_000, max(1, len(corpus))),
+        corpus_chunk_size=min(corpus_chunk_size, max(1, len(corpus))),
         mrr_at_k=[10],
         ndcg_at_k=[10],
         accuracy_at_k=[1, 5, 10],
@@ -874,6 +1081,12 @@ def mine_hard_negatives(
     base_model: str,
     top_k: int,
     min_margin: float,
+    mining_batch_size: int,
+    mining_chunk_size: int,
+    hnsw_m: int,
+    hnsw_ef_construction: int,
+    hnsw_ef_search_factor: int,
+    negative_max_token_jaccard: float,
     seed: int,
     logger: logging.Logger,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -885,6 +1098,12 @@ def mine_hard_negatives(
         "row_uids": sorted(train_frame["row_uid"].tolist()),
         "top_k": top_k,
         "min_margin": min_margin,
+        "mining_batch_size": mining_batch_size,
+        "mining_chunk_size": mining_chunk_size,
+        "hnsw_m": hnsw_m,
+        "hnsw_ef_construction": hnsw_ef_construction,
+        "hnsw_ef_search_factor": hnsw_ef_search_factor,
+        "negative_max_token_jaccard": negative_max_token_jaccard,
         "seed": seed,
         "backend": requested_backend,
     }
@@ -911,7 +1130,7 @@ def mine_hard_negatives(
     logger.info("Encoding %d unique passages for hard-negative mining", len(corpus_texts))
     corpus_embeddings = model.encode(
         corpus_texts,
-        batch_size=64,
+        batch_size=mining_batch_size,
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=True,
@@ -924,11 +1143,11 @@ def mine_hard_negatives(
     if faiss is not None:
         index = faiss.IndexHNSWFlat(
             corpus_embeddings.shape[1],
-            32,
+            hnsw_m,
             faiss.METRIC_INNER_PRODUCT,
         )
-        index.hnsw.efConstruction = 80
-        index.hnsw.efSearch = max(64, top_k * 4)
+        index.hnsw.efConstruction = hnsw_ef_construction
+        index.hnsw.efSearch = max(top_k, top_k * hnsw_ef_search_factor)
         index.add(corpus_embeddings)
         mining_backend = requested_backend
     else:
@@ -939,7 +1158,7 @@ def mine_hard_negatives(
     negatives: list[str] = []
     mining_modes: Counter[str] = Counter()
     margins: list[float] = []
-    chunk_size = 512
+    chunk_size = mining_chunk_size
     fallback_indices = random_negative_indices(train_frame["component"].astype(str).tolist(), seed)
 
     for start in range(0, len(train_frame), chunk_size):
@@ -947,7 +1166,7 @@ def mine_hard_negatives(
         chunk = train_frame.iloc[start:stop]
         query_embeddings = model.encode(
             [QUERY_PREFIX + value for value in chunk["query"].tolist()],
-            batch_size=64,
+            batch_size=mining_batch_size,
             show_progress_bar=False,
             convert_to_numpy=True,
             normalize_embeddings=True,
@@ -975,7 +1194,7 @@ def mine_hard_negatives(
                     continue
                 if corpus_components[candidate_index] == str(row.component):
                     continue
-                if token_jaccard(str(row.positive_norm), corpus_norms[candidate_index]) >= 0.88:
+                if token_jaccard(str(row.positive_norm), corpus_norms[candidate_index]) >= negative_max_token_jaccard:
                     continue
                 if float(candidate_score) <= positive_score - min_margin:
                     selected = candidate_index
@@ -1025,8 +1244,14 @@ def mine_hard_negatives(
     return mined, metadata
 
 
-def make_loss(model: SentenceTransformer, dims: Sequence[int]) -> torch.nn.Module:
-    base_loss = MultipleNegativesRankingLoss(model=model, scale=20.0)
+def make_loss(
+    model: SentenceTransformer,
+    dims: Sequence[int],
+    loss_scale: float,
+    matryoshka_weights: Sequence[float],
+    matryoshka_dims_per_step: int,
+) -> torch.nn.Module:
+    base_loss = MultipleNegativesRankingLoss(model=model, scale=loss_scale)
     embedding_dimension = (
         model.get_embedding_dimension()
         if hasattr(model, "get_embedding_dimension")
@@ -1037,62 +1262,69 @@ def make_loss(model: SentenceTransformer, dims: Sequence[int]) -> torch.nn.Modul
     valid_dims = [dimension for dimension in dims if dimension <= embedding_dimension]
     if len(valid_dims) <= 1:
         return base_loss
-    weights = [1.0] + [0.35] * (len(valid_dims) - 1)
+    valid_weights = list(matryoshka_weights[: len(valid_dims)])
     return MatryoshkaLoss(
         model=model,
         loss=base_loss,
         matryoshka_dims=valid_dims,
-        matryoshka_weights=weights,
-        n_dims_per_step=-1,
+        matryoshka_weights=valid_weights,
+        n_dims_per_step=matryoshka_dims_per_step,
     )
+
+
+def _installed_transformers_major() -> int:
+    try:
+        return Version(package_version("transformers")).major
+    except (PackageNotFoundError, ValueError):
+        return 0
 
 
 def make_training_args(
     output_dir: Path,
     epochs: float,
     batch_size: int,
+    eval_batch_size: int,
     learning_rate: float,
     weight_decay: float,
     warmup_ratio: float,
-    train_rows: int,
+    lr_scheduler_type: str,
+    gradient_accumulation_steps: int,
+    max_grad_norm: float,
+    gradient_checkpointing: bool,
+    dataloader_num_workers: int,
+    dataloader_drop_last: bool,
+    logging_steps: int,
+    save_total_limit: int,
+    primary_metric: str,
+    load_best_model_at_end: bool,
     seed: int,
     use_bf16: bool,
 ) -> SentenceTransformerTrainingArguments:
-    """Build arguments across the supported Transformers 4.x and 5.x APIs.
+    """Build safe arguments across supported Transformers 4.x and 5.x APIs."""
 
-    Transformers 5 removed ``save_safetensors`` and replaced ``warmup_ratio``
-    with a float-capable ``warmup_steps`` field. Sentence Transformers 5.6.1
-    supports both major Transformers lines, so detect the installed signature
-    instead of assuming one version.
-    """
-
-    steps_per_epoch = max(1, math.ceil(train_rows / batch_size))
-    save_steps = max(100, min(250, max(1, steps_per_epoch // 4)))
     supported = set(inspect.signature(SentenceTransformerTrainingArguments.__init__).parameters)
-
     kwargs: dict[str, Any] = {
         "output_dir": str(output_dir),
         "num_train_epochs": epochs,
         "per_device_train_batch_size": batch_size,
-        "per_device_eval_batch_size": max(16, min(64, batch_size * 2)),
+        "per_device_eval_batch_size": eval_batch_size,
         "learning_rate": learning_rate,
-        "lr_scheduler_type": "cosine",
+        "lr_scheduler_type": lr_scheduler_type,
         "weight_decay": weight_decay,
-        "max_grad_norm": 1.0,
+        "max_grad_norm": max_grad_norm,
         "fp16": False,
         "bf16": use_bf16,
-        "gradient_accumulation_steps": 1,
-        "gradient_checkpointing": False,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "gradient_checkpointing": gradient_checkpointing,
         "batch_sampler": BatchSamplers.NO_DUPLICATES,
-        "dataloader_num_workers": 0,
+        "dataloader_num_workers": dataloader_num_workers,
         "dataloader_pin_memory": False,
-        "dataloader_drop_last": True,
-        "save_strategy": "steps",
-        "save_steps": save_steps,
-        "save_total_limit": 1,
-        "load_best_model_at_end": False,
+        "dataloader_drop_last": dataloader_drop_last,
+        "save_strategy": "epoch",
+        "save_total_limit": max(2 if load_best_model_at_end else 1, save_total_limit),
+        "load_best_model_at_end": load_best_model_at_end,
         "logging_strategy": "steps",
-        "logging_steps": 25,
+        "logging_steps": logging_steps,
         "logging_first_step": True,
         "report_to": "none",
         "optim": "adamw_torch",
@@ -1100,6 +1332,15 @@ def make_training_args(
         "data_seed": seed,
         "remove_unused_columns": True,
     }
+
+    if load_best_model_at_end:
+        kwargs["metric_for_best_model"] = primary_metric
+        kwargs["greater_is_better"] = True
+
+    if "restore_callback_states_from_checkpoint" in supported:
+        kwargs["restore_callback_states_from_checkpoint"] = True
+    if "save_only_model" in supported:
+        kwargs["save_only_model"] = False
 
     if "use_cpu" in supported:
         kwargs["use_cpu"] = True
@@ -1120,10 +1361,14 @@ def make_training_args(
             "The installed Transformers TrainingArguments has no evaluation-strategy field."
         )
 
-    if "warmup_ratio" in supported:
+    transformers_major = _installed_transformers_major()
+    if transformers_major >= 5 and "warmup_steps" in supported:
+        # Transformers 5 accepts a float in [0, 1) here as a ratio and warns
+        # when the legacy warmup_ratio field is used.
+        kwargs["warmup_steps"] = warmup_ratio
+    elif "warmup_ratio" in supported:
         kwargs["warmup_ratio"] = warmup_ratio
     elif "warmup_steps" in supported:
-        # Transformers 5 accepts a float in [0, 1) as a ratio.
         kwargs["warmup_steps"] = warmup_ratio
     else:
         raise RuntimeError(
@@ -1131,8 +1376,6 @@ def make_training_args(
         )
 
     if "save_safetensors" in supported:
-        # Transformers 4 exposes this option. Transformers 5 always saves safely
-        # and removed the argument entirely.
         kwargs["save_safetensors"] = True
 
     unsupported = sorted(key for key in kwargs if key not in supported)
@@ -1164,38 +1407,89 @@ def train_stage(
     output: Path,
     epochs: float,
     batch_size: int,
+    eval_batch_size: int,
+    eval_loss_rows: int,
     learning_rate: float,
     weight_decay: float,
     warmup_ratio: float,
+    lr_scheduler_type: str,
+    gradient_accumulation_steps: int,
+    max_grad_norm: float,
+    gradient_checkpointing: bool,
+    dataloader_num_workers: int,
+    dataloader_drop_last: bool,
+    logging_steps: int,
+    save_total_limit: int,
     dims: Sequence[int],
+    matryoshka_weights: Sequence[float],
+    matryoshka_dims_per_step: int,
+    loss_scale: float,
     include_negative: bool,
     resume: bool,
     seed: int,
     use_bf16: bool,
+    early_stopping: bool,
+    early_stopping_patience: int,
+    early_stopping_threshold: float,
+    load_best_model_at_end: bool,
     logger: logging.Logger,
 ) -> tuple[SentenceTransformer, dict[str, Any]]:
     checkpoint_dir = output / "checkpoints" / stage_name
     model_dir = output / "models" / stage_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     train_dataset = formatted_dataset(train_frame, include_negative=include_negative)
-    eval_loss_frame = eval_frame.head(min(512, len(eval_frame))).copy()
+    eval_loss_frame = eval_frame.head(min(eval_loss_rows, len(eval_frame))).copy()
     if include_negative and "negative" not in eval_loss_frame.columns:
         # Evaluation loss can safely use pairs while the stage trains on triplets.
         eval_dataset = formatted_dataset(eval_loss_frame, include_negative=False)
     else:
         eval_dataset = formatted_dataset(eval_loss_frame, include_negative=include_negative)
-    loss = make_loss(model, dims)
+    loss = make_loss(
+        model,
+        dims=dims,
+        loss_scale=loss_scale,
+        matryoshka_weights=matryoshka_weights,
+        matryoshka_dims_per_step=matryoshka_dims_per_step,
+    )
+    primary_metric = str(evaluator.primary_metric)
     training_args = make_training_args(
         output_dir=checkpoint_dir,
         epochs=epochs,
         batch_size=batch_size,
+        eval_batch_size=eval_batch_size,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
-        train_rows=len(train_frame),
+        lr_scheduler_type=lr_scheduler_type,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        gradient_checkpointing=gradient_checkpointing,
+        dataloader_num_workers=dataloader_num_workers,
+        dataloader_drop_last=dataloader_drop_last,
+        logging_steps=logging_steps,
+        save_total_limit=save_total_limit,
+        primary_metric=primary_metric,
+        load_best_model_at_end=load_best_model_at_end,
         seed=seed,
         use_bf16=use_bf16,
     )
+
+    callbacks: list[Any] = []
+    early_stopping_active = bool(early_stopping and epochs > 1.0)
+    if early_stopping_active:
+        callbacks.append(
+            EarlyStoppingCallback(
+                early_stopping_patience=early_stopping_patience,
+                early_stopping_threshold=early_stopping_threshold,
+            )
+        )
+    elif early_stopping:
+        logger.info(
+            "%s early stopping is configured but inactive because max epochs is %.2f",
+            stage_name,
+            epochs,
+        )
+
     trainer = SentenceTransformerTrainer(
         model=model,
         args=training_args,
@@ -1203,38 +1497,81 @@ def train_stage(
         eval_dataset=eval_dataset,
         loss=loss,
         evaluator=evaluator,
+        callbacks=callbacks,
     )
     last_checkpoint = get_last_checkpoint(str(checkpoint_dir)) if checkpoint_dir.exists() else None
     resume_from = last_checkpoint if resume and last_checkpoint else None
     logger.info(
-        "Starting %s: rows=%d epochs=%.2f batch=%d lr=%g resume=%s",
+        "Starting %s: rows=%d max_epochs=%.2f batch=%d lr=%g early_stop=%s patience=%d threshold=%g metric=%s resume=%s",
         stage_name,
         len(train_frame),
         epochs,
         batch_size,
         learning_rate,
+        early_stopping_active,
+        early_stopping_patience,
+        early_stopping_threshold,
+        primary_metric,
         resume_from or "none",
     )
     started = time.perf_counter()
     result = trainer.train(resume_from_checkpoint=resume_from)
     duration = time.perf_counter() - started
+
+    # When load_best_model_at_end is enabled, Trainer has already restored the
+    # best validation checkpoint here. Saving now promotes that model, not the
+    # final (possibly overfit) epoch.
     trainer.save_model(str(model_dir))
     trainer.save_state()
+    completed_epochs = float(trainer.state.epoch or 0.0)
+    stopped_early = bool(early_stopping_active and completed_epochs + 1e-6 < epochs)
     summary = {
         "stage": stage_name,
         "rows": len(train_frame),
-        "epochs": epochs,
+        "max_epochs": epochs,
+        "completed_epochs": completed_epochs,
+        "stopped_early": stopped_early,
         "batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "effective_batch_size": batch_size * gradient_accumulation_steps,
         "learning_rate": learning_rate,
         "bf16_cpu_amp": use_bf16,
+        "early_stopping": {
+            "enabled": early_stopping_active,
+            "patience_evaluations": early_stopping_patience,
+            "minimum_improvement": early_stopping_threshold,
+            "metric": primary_metric,
+            "greater_is_better": True,
+        },
+        "best_metric": (
+            float(trainer.state.best_metric)
+            if trainer.state.best_metric is not None
+            else None
+        ),
+        "best_model_checkpoint": trainer.state.best_model_checkpoint,
+        "load_best_model_at_end": load_best_model_at_end,
         "duration_seconds": duration,
         "global_step": int(trainer.state.global_step),
         "training_loss": float(result.training_loss),
-        "metrics": {key: float(value) for key, value in result.metrics.items() if isinstance(value, (int, float))},
+        "metrics": {
+            key: float(value)
+            for key, value in result.metrics.items()
+            if isinstance(value, (int, float))
+        },
         "model_dir": str(model_dir),
     }
     atomic_write_json(output / "reports" / f"{stage_name}.json", summary)
-    logger.info("%s complete: step=%d loss=%.6f seconds=%.2f", stage_name, summary["global_step"], summary["training_loss"], duration)
+    logger.info(
+        "%s complete: step=%d epochs=%.3f stopped_early=%s best_%s=%s loss=%.6f seconds=%.2f",
+        stage_name,
+        summary["global_step"],
+        completed_epochs,
+        stopped_early,
+        primary_metric,
+        f"{summary['best_metric']:.6f}" if summary["best_metric"] is not None else "n/a",
+        summary["training_loss"],
+        duration,
+    )
     return model, summary
 
 
@@ -1256,6 +1593,7 @@ def detailed_retrieval_metrics(
     model: SentenceTransformer,
     bundle: EvalBundle,
     dimensions: Sequence[int],
+    batch_size: int,
     logger: logging.Logger,
     include_confidence_calibration: bool = False,
 ) -> dict[str, Any]:
@@ -1270,14 +1608,14 @@ def detailed_retrieval_metrics(
     started = time.perf_counter()
     corpus_embeddings_full = model.encode(
         corpus_texts,
-        batch_size=64,
+        batch_size=batch_size,
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=True,
     ).astype("float32", copy=False)
     query_embeddings_full = model.encode(
         query_texts,
-        batch_size=64,
+        batch_size=batch_size,
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=True,
@@ -1486,6 +1824,9 @@ def main() -> int:
     args = parse_args()
     profile = profile_with_overrides(args)
     validate_profile(profile, args)
+    if args.print_config:
+        print(json.dumps(effective_configuration_preview(args, profile), indent=2, sort_keys=True))
+        return 0
     output = args.output.resolve()
     if args.overwrite_output and output.exists():
         protected = {Path("/").resolve(), Path.home().resolve(), Path.cwd().resolve()}
@@ -1493,9 +1834,17 @@ def main() -> int:
             raise RuntimeError(f"Refusing to delete protected output path: {output}")
         shutil.rmtree(output)
     logger = configure_logging(output)
+    logger.info("Configuration file: %s", LOADED_ENV_FILE or "none (built-in defaults and shell/CLI only)")
+    logger.info("Selected profile: %s", profile.name)
     configured_threads = configure_runtime(args.threads, args.seed, logger)
     system = system_report(output, configured_threads)
-    preflight(system, logger)
+    preflight(
+        system,
+        min_available_memory_gib=args.min_available_memory_gib,
+        min_free_disk_gib=args.min_free_disk_gib,
+        warn_free_disk_gib=args.warn_free_disk_gib,
+        logger=logger,
+    )
     use_bf16 = bool(system["cpu_has_bf16"]) if args.bf16 is None else bool(args.bf16)
     logger.info("CPU BF16 autocast: %s", "enabled" if use_bf16 else "disabled")
 
@@ -1506,23 +1855,87 @@ def main() -> int:
         boilerplate_threshold=args.boilerplate_threshold,
         seed=args.seed,
         max_train_rows=profile.max_train_rows,
+        split_fractions={
+            "train": args.train_split_fraction,
+            "validation": args.validation_split_fraction,
+            "test": args.test_split_fraction,
+        },
         logger=logger,
     )
     run_config = {
         "script_version": SCRIPT_VERSION,
         "base_model": args.base_model,
         "profile": dataclasses.asdict(profile),
-        "stage1_lr": args.stage1_lr,
-        "stage2_lr": args.stage2_lr,
-        "weight_decay": args.weight_decay,
-        "warmup_ratio": args.warmup_ratio,
-        "min_hard_negative_margin": args.min_hard_negative_margin,
-        "boilerplate_threshold": args.boilerplate_threshold,
-        "bf16_cpu_amp": use_bf16,
-        "seed": args.seed,
-        "data_source_sha256": dataset_meta["cache_key"]["source_sha256"],
+        "dataset": {
+            "source_sha256": dataset_meta["cache_key"]["source_sha256"],
+            "boilerplate_threshold": args.boilerplate_threshold,
+            "split_fractions": {
+                "train": args.train_split_fraction,
+                "validation": args.validation_split_fraction,
+                "test": args.test_split_fraction,
+            },
+        },
+        "runtime": {
+            "threads": configured_threads,
+            "bf16_cpu_amp": use_bf16,
+            "seed": args.seed,
+        },
+        "optimizer": {
+            "stage1_lr": args.stage1_lr,
+            "stage2_lr": args.stage2_lr,
+            "weight_decay": args.weight_decay,
+            "warmup_ratio": args.warmup_ratio,
+            "lr_scheduler_type": args.lr_scheduler_type,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "max_grad_norm": args.max_grad_norm,
+            "gradient_checkpointing": args.gradient_checkpointing,
+            "dataloader_num_workers": args.dataloader_num_workers,
+            "dataloader_drop_last": args.dataloader_drop_last,
+            "logging_steps": args.logging_steps,
+            "save_total_limit": args.save_total_limit,
+        },
+        "evaluation": {
+            "batch_size": args.eval_batch_size,
+            "loss_rows": args.eval_loss_rows,
+            "corpus_chunk_size": args.eval_corpus_chunk_size,
+            "early_stopping": args.early_stopping,
+            "early_stopping_patience": args.early_stopping_patience,
+            "early_stopping_threshold": args.early_stopping_threshold,
+            "load_best_model_at_end": args.load_best_model_at_end,
+        },
+        "hard_negative_mining": {
+            "minimum_margin": args.min_hard_negative_margin,
+            "batch_size": args.mining_batch_size,
+            "chunk_size": args.mining_chunk_size,
+            "hnsw_m": args.hnsw_m,
+            "hnsw_ef_construction": args.hnsw_ef_construction,
+            "hnsw_ef_search_factor": args.hnsw_ef_search_factor,
+            "maximum_token_jaccard": args.negative_max_token_jaccard,
+        },
+        "preflight": {
+            "min_available_memory_gib": args.min_available_memory_gib,
+            "min_free_disk_gib": args.min_free_disk_gib,
+            "warn_free_disk_gib": args.warn_free_disk_gib,
+        },
+        "loss": {
+            "scale": args.loss_scale,
+            "matryoshka_weights": list(args.matryoshka_weights),
+            "matryoshka_dims_per_step": args.matryoshka_dims_per_step,
+        },
     }
-    atomic_write_json(output / "run_config.json", run_config)
+    resume_config = {
+        key: value
+        for key, value in run_config.items()
+        if key not in {"preflight"}
+    }
+    atomic_write_json(
+        output / "run_config.json",
+        {
+            "configuration_source": str(LOADED_ENV_FILE) if LOADED_ENV_FILE else None,
+            "effective_training_config": run_config,
+            "resume_compatibility_config": resume_config,
+        },
+    )
     if args.prepare_only:
         logger.info("Dataset preparation complete; --prepare-only requested, so training is skipped")
         return 0
@@ -1531,7 +1944,7 @@ def main() -> int:
     state: dict[str, Any] = {}
     if state_path.exists() and args.resume:
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("run_config") != run_config:
+        if state.get("run_config") != resume_config:
             raise RuntimeError(
                 "Existing output was created with a different configuration. Use a new --output or --overwrite-output."
             )
@@ -1539,7 +1952,7 @@ def main() -> int:
         raise RuntimeError("Output already contains training state. Use --resume or --overwrite-output.")
     else:
         state = {
-            "run_config": run_config,
+            "run_config": resume_config,
             "stage1_complete": False,
             "stage2_complete": False,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1584,7 +1997,8 @@ def main() -> int:
         max_queries=profile.eval_queries,
         max_corpus=profile.eval_corpus,
         seed=args.seed,
-        batch_size=64,
+        batch_size=args.eval_batch_size,
+        corpus_chunk_size=args.eval_corpus_chunk_size,
         output_path=output / "evaluation" / "validation",
     )
     test_bundle = build_eval_bundle(
@@ -1594,7 +2008,8 @@ def main() -> int:
         max_queries=profile.eval_queries,
         max_corpus=profile.eval_corpus,
         seed=args.seed + 1,
-        batch_size=64,
+        batch_size=args.eval_batch_size,
+        corpus_chunk_size=args.eval_corpus_chunk_size,
         output_path=output / "evaluation" / "test",
     )
 
@@ -1657,14 +2072,31 @@ def main() -> int:
                 output=output,
                 epochs=profile.stage1_epochs,
                 batch_size=profile.batch_size,
+                eval_batch_size=args.eval_batch_size,
+                eval_loss_rows=args.eval_loss_rows,
                 learning_rate=args.stage1_lr,
                 weight_decay=args.weight_decay,
                 warmup_ratio=args.warmup_ratio,
+                lr_scheduler_type=args.lr_scheduler_type,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                max_grad_norm=args.max_grad_norm,
+                gradient_checkpointing=args.gradient_checkpointing,
+                dataloader_num_workers=args.dataloader_num_workers,
+                dataloader_drop_last=args.dataloader_drop_last,
+                logging_steps=args.logging_steps,
+                save_total_limit=args.save_total_limit,
                 dims=profile.matryoshka_dims,
+                matryoshka_weights=args.matryoshka_weights,
+                matryoshka_dims_per_step=args.matryoshka_dims_per_step,
+                loss_scale=args.loss_scale,
                 include_negative=False,
                 resume=args.resume,
                 seed=args.seed,
                 use_bf16=use_bf16,
+                early_stopping=args.early_stopping,
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_threshold=args.early_stopping_threshold,
+                load_best_model_at_end=args.load_best_model_at_end,
                 logger=logger,
             )
             stage_summaries["stage1"] = stage1_summary
@@ -1692,6 +2124,12 @@ def main() -> int:
                 base_model=args.base_model,
                 top_k=profile.mining_top_k,
                 min_margin=args.min_hard_negative_margin,
+                mining_batch_size=args.mining_batch_size,
+                mining_chunk_size=args.mining_chunk_size,
+                hnsw_m=args.hnsw_m,
+                hnsw_ef_construction=args.hnsw_ef_construction,
+                hnsw_ef_search_factor=args.hnsw_ef_search_factor,
+                negative_max_token_jaccard=args.negative_max_token_jaccard,
                 seed=args.seed,
                 logger=logger,
             )
@@ -1705,14 +2143,31 @@ def main() -> int:
                 output=output,
                 epochs=profile.stage2_epochs,
                 batch_size=profile.batch_size,
+                eval_batch_size=args.eval_batch_size,
+                eval_loss_rows=args.eval_loss_rows,
                 learning_rate=args.stage2_lr,
                 weight_decay=args.weight_decay,
                 warmup_ratio=args.warmup_ratio,
+                lr_scheduler_type=args.lr_scheduler_type,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                max_grad_norm=args.max_grad_norm,
+                gradient_checkpointing=args.gradient_checkpointing,
+                dataloader_num_workers=args.dataloader_num_workers,
+                dataloader_drop_last=args.dataloader_drop_last,
+                logging_steps=args.logging_steps,
+                save_total_limit=args.save_total_limit,
                 dims=profile.matryoshka_dims,
+                matryoshka_weights=args.matryoshka_weights,
+                matryoshka_dims_per_step=args.matryoshka_dims_per_step,
+                loss_scale=args.loss_scale,
                 include_negative=True,
                 resume=args.resume,
                 seed=args.seed + 1,
                 use_bf16=use_bf16,
+                early_stopping=args.early_stopping,
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_threshold=args.early_stopping_threshold,
+                load_best_model_at_end=args.load_best_model_at_end,
                 logger=logger,
             )
             stage_summaries["stage2"] = stage2_summary
@@ -1798,6 +2253,7 @@ def main() -> int:
         final_model,
         validation_bundle,
         dimensions=profile.matryoshka_dims,
+        batch_size=args.eval_batch_size,
         logger=logger,
         include_confidence_calibration=True,
     )
@@ -1805,6 +2261,7 @@ def main() -> int:
         final_model,
         test_bundle,
         dimensions=profile.matryoshka_dims,
+        batch_size=args.eval_batch_size,
         logger=logger,
         include_confidence_calibration=False,
     )
@@ -1813,6 +2270,8 @@ def main() -> int:
         "script_version": SCRIPT_VERSION,
         "base_model": args.base_model,
         "profile": dataclasses.asdict(profile),
+        "configuration_source": str(LOADED_ENV_FILE) if LOADED_ENV_FILE else None,
+        "run_config": run_config,
         "bf16_cpu_amp": use_bf16,
         "system": system,
         "dataset": dataset_meta,

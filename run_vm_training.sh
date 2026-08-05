@@ -9,16 +9,31 @@ if [ ! -x .venv/bin/python ]; then
   exit 1
 fi
 
-export SWICO_CPU_THREADS="${SWICO_CPU_THREADS:-8}"
-export OMP_NUM_THREADS="$SWICO_CPU_THREADS"
-export MKL_NUM_THREADS="$SWICO_CPU_THREADS"
-export OPENBLAS_NUM_THREADS="$SWICO_CPU_THREADS"
-export NUMEXPR_NUM_THREADS="$SWICO_CPU_THREADS"
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_DISABLE_TELEMETRY=1
 export PYTHONUNBUFFERED=1
 export MALLOC_ARENA_MAX=2
-export HF_HOME="$ROOT_DIR/.hf_cache"
+export HF_HOME="${HF_HOME:-$ROOT_DIR/.hf_cache}"
 
-PROFILE="${SWICO_PROFILE:-vm}"
-exec .venv/bin/python train_vm.py --profile "$PROFILE" --resume "$@"
+HAS_ENV_FILE=false
+for argument in "$@"; do
+  case "$argument" in
+    --env-file|--env-file=*)
+      HAS_ENV_FILE=true
+      break
+      ;;
+  esac
+done
+
+if [ "$HAS_ENV_FILE" = true ]; then
+  exec .venv/bin/python train_vm.py "$@"
+fi
+
+ENV_FILE="${SWICO_ENV_FILE:-$ROOT_DIR/training.env}"
+if [ ! -f "$ENV_FILE" ]; then
+  echo "Training configuration file is missing: $ENV_FILE"
+  echo "Copy training.env.example to training.env, then edit the values."
+  exit 1
+fi
+
+exec .venv/bin/python train_vm.py --env-file "$ENV_FILE" "$@"

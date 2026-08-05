@@ -7,3 +7,4 @@ pandas>=2.2,<3
 numpy>=1.26,<3
 psutil>=5.9,<8
 safetensors>=0.5,<1
+python-dotenv>=1.1,<2

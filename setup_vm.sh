@@ -23,9 +23,23 @@ python -m pip install --no-cache-dir -r requirements-cpu.txt
 
 python - <<'PY'
 import importlib
-packages = ["torch", "sentence_transformers", "datasets", "transformers", "faiss", "pandas", "numpy", "psutil"]
+
+packages = [
+    "torch",
+    "sentence_transformers",
+    "datasets",
+    "transformers",
+    "faiss",
+    "pandas",
+    "numpy",
+    "psutil",
+    "dotenv",
+]
 for package in packages:
     module = importlib.import_module(package)
     print(f"{package}: {getattr(module, '__version__', 'installed')}")
-print("CPU training environment is ready.")
 PY
+
+python -m unittest discover -s tests -v
+python verify_install.py
+printf '%s\n' "CPU training environment is ready."
