@@ -33,6 +33,7 @@ import dataclasses
 import datetime as dt
 import gc
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -69,28 +70,25 @@ try:
 except ImportError:
     faiss = None
 
+from sentence_transformers import (
+    SentenceTransformer,
+    SentenceTransformerTrainer,
+    SentenceTransformerTrainingArguments,
+)
+
 try:
-    from sentence_transformers import (
-        SentenceTransformer,
-        SentenceTransformerTrainer,
-        SentenceTransformerTrainingArguments,
-    )
-    from sentence_transformers.evaluation import InformationRetrievalEvaluator
-    from sentence_transformers.losses import MatryoshkaLoss, MultipleNegativesRankingLoss
-    from sentence_transformers.training_args import BatchSamplers
-except ImportError:
-    # Compatibility with the namespaced layout used by newer releases.
-    from sentence_transformers import (
-        SentenceTransformer,
-        SentenceTransformerTrainer,
-        SentenceTransformerTrainingArguments,
-    )
+    # Sentence Transformers 5.6+ namespaced paths. Import these first to avoid
+    # deprecation warnings while keeping a fallback for older compatible releases.
     from sentence_transformers.sentence_transformer.evaluation import InformationRetrievalEvaluator
     from sentence_transformers.sentence_transformer.losses import (
         MatryoshkaLoss,
         MultipleNegativesRankingLoss,
     )
     from sentence_transformers.sentence_transformer.training_args import BatchSamplers
+except ImportError:
+    from sentence_transformers.evaluation import InformationRetrievalEvaluator
+    from sentence_transformers.losses import MatryoshkaLoss, MultipleNegativesRankingLoss
+    from sentence_transformers.training_args import BatchSamplers
 
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -98,7 +96,7 @@ from transformers.trainer_utils import get_last_checkpoint
 BASE_MODEL = "intfloat/multilingual-e5-small"
 QUERY_PREFIX = "query: "
 PASSAGE_PREFIX = "passage: "
-SCRIPT_VERSION = "2.1.0-cpu"
+SCRIPT_VERSION = "2.1.1-cpu"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1060,42 +1058,101 @@ def make_training_args(
     seed: int,
     use_bf16: bool,
 ) -> SentenceTransformerTrainingArguments:
+    """Build arguments across the supported Transformers 4.x and 5.x APIs.
+
+    Transformers 5 removed ``save_safetensors`` and replaced ``warmup_ratio``
+    with a float-capable ``warmup_steps`` field. Sentence Transformers 5.6.1
+    supports both major Transformers lines, so detect the installed signature
+    instead of assuming one version.
+    """
+
     steps_per_epoch = max(1, math.ceil(train_rows / batch_size))
     save_steps = max(100, min(250, max(1, steps_per_epoch // 4)))
-    return SentenceTransformerTrainingArguments(
-        output_dir=str(output_dir),
-        num_train_epochs=epochs,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=max(16, min(64, batch_size * 2)),
-        learning_rate=learning_rate,
-        warmup_ratio=warmup_ratio,
-        lr_scheduler_type="cosine",
-        weight_decay=weight_decay,
-        max_grad_norm=1.0,
-        fp16=False,
-        bf16=use_bf16,
-        use_cpu=True,
-        gradient_accumulation_steps=1,
-        gradient_checkpointing=False,
-        batch_sampler=BatchSamplers.NO_DUPLICATES,
-        dataloader_num_workers=0,
-        dataloader_pin_memory=False,
-        dataloader_drop_last=True,
-        eval_strategy="epoch",
-        save_strategy="steps",
-        save_steps=save_steps,
-        save_total_limit=1,
-        save_safetensors=True,
-        load_best_model_at_end=False,
-        logging_strategy="steps",
-        logging_steps=25,
-        logging_first_step=True,
-        report_to="none",
-        optim="adamw_torch",
-        seed=seed,
-        data_seed=seed,
-        remove_unused_columns=True,
-    )
+    supported = set(inspect.signature(SentenceTransformerTrainingArguments.__init__).parameters)
+
+    kwargs: dict[str, Any] = {
+        "output_dir": str(output_dir),
+        "num_train_epochs": epochs,
+        "per_device_train_batch_size": batch_size,
+        "per_device_eval_batch_size": max(16, min(64, batch_size * 2)),
+        "learning_rate": learning_rate,
+        "lr_scheduler_type": "cosine",
+        "weight_decay": weight_decay,
+        "max_grad_norm": 1.0,
+        "fp16": False,
+        "bf16": use_bf16,
+        "gradient_accumulation_steps": 1,
+        "gradient_checkpointing": False,
+        "batch_sampler": BatchSamplers.NO_DUPLICATES,
+        "dataloader_num_workers": 0,
+        "dataloader_pin_memory": False,
+        "dataloader_drop_last": True,
+        "save_strategy": "steps",
+        "save_steps": save_steps,
+        "save_total_limit": 1,
+        "load_best_model_at_end": False,
+        "logging_strategy": "steps",
+        "logging_steps": 25,
+        "logging_first_step": True,
+        "report_to": "none",
+        "optim": "adamw_torch",
+        "seed": seed,
+        "data_seed": seed,
+        "remove_unused_columns": True,
+    }
+
+    if "use_cpu" in supported:
+        kwargs["use_cpu"] = True
+    elif "no_cuda" in supported:
+        kwargs["no_cuda"] = True
+    else:
+        raise RuntimeError(
+            "The installed Transformers TrainingArguments has neither use_cpu nor no_cuda; "
+            "this release is not supported by the CPU trainer."
+        )
+
+    if "eval_strategy" in supported:
+        kwargs["eval_strategy"] = "epoch"
+    elif "evaluation_strategy" in supported:
+        kwargs["evaluation_strategy"] = "epoch"
+    else:
+        raise RuntimeError(
+            "The installed Transformers TrainingArguments has no evaluation-strategy field."
+        )
+
+    if "warmup_ratio" in supported:
+        kwargs["warmup_ratio"] = warmup_ratio
+    elif "warmup_steps" in supported:
+        # Transformers 5 accepts a float in [0, 1) as a ratio.
+        kwargs["warmup_steps"] = warmup_ratio
+    else:
+        raise RuntimeError(
+            "The installed Transformers TrainingArguments has no warmup_ratio or warmup_steps field."
+        )
+
+    if "save_safetensors" in supported:
+        # Transformers 4 exposes this option. Transformers 5 always saves safely
+        # and removed the argument entirely.
+        kwargs["save_safetensors"] = True
+
+    unsupported = sorted(key for key in kwargs if key not in supported)
+    if unsupported:
+        try:
+            import sentence_transformers as sentence_transformers_package
+            import transformers as transformers_package
+
+            versions = (
+                f"sentence-transformers={getattr(sentence_transformers_package, '__version__', 'unknown')} "
+                f"transformers={getattr(transformers_package, '__version__', 'unknown')}"
+            )
+        except Exception:
+            versions = "installed package versions unavailable"
+        raise RuntimeError(
+            "Unsupported training arguments for the installed libraries: "
+            f"{', '.join(unsupported)} ({versions})."
+        )
+
+    return SentenceTransformerTrainingArguments(**kwargs)
 
 
 def train_stage(
