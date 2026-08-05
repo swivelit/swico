@@ -6,7 +6,7 @@ Designed for a 4-physical-core / 8-logical-CPU VM with about 29 GiB RAM,
 no GPU, and constrained compute. It fine-tunes intfloat/multilingual-e5-small
 for query-to-passage retrieval; it does not train a general-purpose LLM.
 
-Version 3 capabilities:
+Version 4 capabilities:
 - typed training.env configuration with strict validation and CLI overrides
 - leakage-resistant connected-component data splitting
 - repeated-boilerplate removal and exact-pair deduplication
@@ -18,6 +18,8 @@ Version 3 capabilities:
 - automatic restoration of the best validation checkpoint
 - stage-1 versus stage-2 validation selection
 - bounded IR evaluation, confidence calibration and latency reporting
+- timestamped run directories with automatic compatible resume
+- resource-aware safe autotuning, memory guard and baseline quality protection
 - resumable, configuration-safe checkpoints and disk cleanup
 
 Examples:
@@ -118,14 +120,18 @@ except ImportError:
     from sentence_transformers.losses import MatryoshkaLoss, MultipleNegativesRankingLoss
     from sentence_transformers.training_args import BatchSamplers
 
-from transformers import EarlyStoppingCallback
+from transformers import EarlyStoppingCallback, TrainerCallback
 from transformers.trainer_utils import get_last_checkpoint
 
 
 BASE_MODEL = "intfloat/multilingual-e5-small"
 QUERY_PREFIX = "query: "
 PASSAGE_PREFIX = "passage: "
-SCRIPT_VERSION = "3.0.0-cpu-env-early-stop"
+SCRIPT_VERSION = "4.0.0-cpu-adaptive-runs"
+
+
+class ResourceStopRequested(RuntimeError):
+    """Raised after a safe checkpoint when the memory guard stops a stage."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -271,7 +277,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--profile", choices=sorted(PROFILES), default=env_text("SWICO_PROFILE", "vm"))
     parser.add_argument("--data", type=Path, default=_path_from_env("SWICO_DATA_PATH", None), help="CSV file or ZIP containing a CSV")
-    parser.add_argument("--output", type=Path, default=_path_from_env("SWICO_OUTPUT_DIR", "training_artifacts/e5-small-swico"))
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path(env_text("SWICO_OUTPUT_ROOT", "training_artifacts/e5-small-swico")),
+        help="Root that contains timestamped runs/ directories",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=_path_from_env("SWICO_OUTPUT_DIR", None),
+        help="Exact run directory override; normally leave SWICO_OUTPUT_DIR=auto",
+    )
+    parser.add_argument(
+        "--run-mode",
+        choices=("auto", "new", "resume-latest"),
+        default=env_text("SWICO_RUN_MODE", "auto"),
+        help="auto resumes a compatible incomplete run, otherwise creates a timestamped run",
+    )
+    parser.add_argument("--run-id", default=env_optional_text("SWICO_RUN_ID"))
+    parser.add_argument("--run-label", default=env_optional_text("SWICO_RUN_LABEL"))
+    parser.add_argument(
+        "--create-latest-links",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("SWICO_CREATE_LATEST_LINKS", True),
+    )
     parser.add_argument("--base-model", default=env_text("SWICO_BASE_MODEL", BASE_MODEL))
     parser.add_argument("--threads", type=int, default=env_int("SWICO_CPU_THREADS", _DEFAULT_THREADS))
     parser.add_argument("--seed", type=int, default=env_int("SWICO_SEED", 42))
@@ -339,6 +369,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-available-memory-gib", type=float, default=env_float("SWICO_MIN_AVAILABLE_MEMORY_GIB", 8.0))
     parser.add_argument("--min-free-disk-gib", type=float, default=env_float("SWICO_MIN_FREE_DISK_GIB", 2.0))
     parser.add_argument("--warn-free-disk-gib", type=float, default=env_float("SWICO_WARN_FREE_DISK_GIB", 4.0))
+
+    parser.add_argument("--autotune", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_AUTOTUNE", True))
+    parser.add_argument(
+        "--autotune-mode",
+        choices=("safe", "aggressive"),
+        default=env_text("SWICO_AUTOTUNE_MODE", "safe"),
+        help="safe changes only throughput/resource controls; aggressive may also raise the physical training batch",
+    )
+    parser.add_argument("--autotune-max-inference-batch", type=int, default=env_int("SWICO_AUTOTUNE_MAX_INFERENCE_BATCH", 128))
+    parser.add_argument("--autotune-max-train-batch", type=int, default=env_int("SWICO_AUTOTUNE_MAX_TRAIN_BATCH", 96))
+    parser.add_argument("--autotune-memory-reserve-gib", type=float, default=env_float("SWICO_AUTOTUNE_MEMORY_RESERVE_GIB", 8.0))
+    parser.add_argument("--autotune-memory-utilization", type=float, default=env_float("SWICO_AUTOTUNE_MEMORY_UTILIZATION", 0.70))
+    parser.add_argument("--autotune-train-batch", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_AUTOTUNE_TRAIN_BATCH", False))
+
+    parser.add_argument("--memory-guard", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_MEMORY_GUARD", True))
+    parser.add_argument("--memory-guard-interval-steps", type=int, default=env_int("SWICO_MEMORY_GUARD_INTERVAL_STEPS", 5))
+    parser.add_argument("--emergency-available-memory-gib", type=float, default=env_float("SWICO_EMERGENCY_AVAILABLE_MEMORY_GIB", 4.0))
+    parser.add_argument("--max-process-rss-gib", type=float, default=env_optional_float("SWICO_MAX_PROCESS_RSS_GIB"))
+
+    parser.add_argument("--baseline-protection", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_BASELINE_PROTECTION", True))
+    parser.add_argument("--min-validation-gain", type=float, default=env_float("SWICO_MIN_VALIDATION_GAIN", 0.0))
     return parser.parse_args()
 
 
@@ -388,6 +439,176 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     temporary.replace(path)
+
+
+@dataclasses.dataclass(frozen=True)
+class RunContext:
+    root: Path
+    output: Path
+    run_id: str
+    resumed: bool
+    exact_output_override: bool
+    invocation_fingerprint: str
+
+
+def _safe_run_token(value: str, fallback: str = "run") -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._")
+    return (token or fallback)[:80]
+
+
+def _payload_fingerprint(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def invocation_configuration(args: argparse.Namespace, profile: Profile) -> dict[str, Any]:
+    excluded = {
+        "output",
+        "output_root",
+        "run_mode",
+        "run_id",
+        "run_label",
+        "create_latest_links",
+        "overwrite_output",
+        "print_config",
+    }
+    return {
+        "script_version": SCRIPT_VERSION,
+        "profile": dataclasses.asdict(profile),
+        "arguments": {
+            key: _json_safe(value)
+            for key, value in vars(args).items()
+            if key not in excluded
+        },
+    }
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _run_is_complete(run_dir: Path) -> bool:
+    state = _read_json(run_dir / "run_state.json") or {}
+    return bool(state.get("final_evaluation_complete") and state.get("completed_at"))
+
+
+def _latest_compatible_incomplete_run(runs_dir: Path, invocation_fingerprint: str) -> Path | None:
+    if not runs_dir.exists():
+        return None
+    candidates = sorted(
+        (path for path in runs_dir.iterdir() if path.is_dir()),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for candidate in candidates:
+        if _run_is_complete(candidate):
+            continue
+        manifest = _read_json(candidate / "run_manifest.json") or {}
+        if manifest.get("invocation_fingerprint") == invocation_fingerprint:
+            return candidate
+    return None
+
+
+def _allocate_unique_timestamped_run(runs_dir: Path, profile_name: str, label: str | None) -> Path:
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    parts = [timestamp, _safe_run_token(profile_name, "profile")]
+    if label:
+        parts.append(_safe_run_token(label, "experiment"))
+    base = "_".join(parts)
+    for suffix in range(1000):
+        name = base if suffix == 0 else f"{base}-{suffix:02d}"
+        candidate = runs_dir / name
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError("Could not allocate a unique timestamped run directory")
+
+
+def resolve_run_context(args: argparse.Namespace, profile: Profile) -> RunContext:
+    invocation = invocation_configuration(args, profile)
+    fingerprint = _payload_fingerprint(invocation)
+
+    if args.output is not None:
+        output = args.output.expanduser().resolve()
+        return RunContext(
+            root=output.parent,
+            output=output,
+            run_id=output.name,
+            resumed=output.exists() and not _run_is_complete(output),
+            exact_output_override=True,
+            invocation_fingerprint=fingerprint,
+        )
+
+    root = args.output_root.expanduser().resolve()
+    runs_dir = root / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.run_id:
+        run_id = _safe_run_token(args.run_id)
+        output = runs_dir / run_id
+        resumed = output.exists()
+        output.mkdir(parents=True, exist_ok=True)
+        return RunContext(root, output, run_id, resumed, False, fingerprint)
+
+    if args.resume and args.run_mode in {"auto", "resume-latest"}:
+        compatible = _latest_compatible_incomplete_run(runs_dir, fingerprint)
+        if compatible is not None:
+            return RunContext(root, compatible, compatible.name, True, False, fingerprint)
+        if args.run_mode == "resume-latest":
+            raise RuntimeError(
+                "No compatible incomplete run exists under "
+                f"{runs_dir}. Use SWICO_RUN_MODE=new to start a new run."
+            )
+
+    output = _allocate_unique_timestamped_run(runs_dir, profile.name, args.run_label)
+    return RunContext(root, output, output.name, False, False, fingerprint)
+
+
+def _replace_relative_symlink(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link.parent / f".{link.name}.tmp-{os.getpid()}"
+    with contextlib.suppress(FileNotFoundError):
+        temporary.unlink()
+    relative_target = os.path.relpath(target, start=link.parent)
+    temporary.symlink_to(relative_target, target_is_directory=True)
+    os.replace(temporary, link)
+
+
+def update_run_links(context: RunContext, completed: bool = False) -> None:
+    if context.exact_output_override:
+        return
+    context.root.mkdir(parents=True, exist_ok=True)
+    (context.root / "LATEST_RUN.txt").write_text(
+        str(context.output) + "\n", encoding="utf-8"
+    )
+    with contextlib.suppress(OSError):
+        _replace_relative_symlink(context.root / "latest", context.output)
+    if completed:
+        (context.root / "LATEST_COMPLETED_RUN.txt").write_text(
+            str(context.output) + "\n", encoding="utf-8"
+        )
+        with contextlib.suppress(OSError):
+            _replace_relative_symlink(context.root / "latest-completed", context.output)
+        incomplete_pointer = context.root / "LATEST_INCOMPLETE_RUN.txt"
+        with contextlib.suppress(OSError):
+            if incomplete_pointer.read_text(encoding="utf-8").strip() == str(context.output):
+                incomplete_pointer.unlink()
+        incomplete_link = context.root / "latest-incomplete"
+        with contextlib.suppress(OSError):
+            if incomplete_link.is_symlink() and incomplete_link.resolve() == context.output.resolve():
+                incomplete_link.unlink()
+    else:
+        (context.root / "LATEST_INCOMPLETE_RUN.txt").write_text(
+            str(context.output) + "\n", encoding="utf-8"
+        )
+        with contextlib.suppress(OSError):
+            _replace_relative_symlink(context.root / "latest-incomplete", context.output)
 
 
 def stable_hash(text: str, seed: int = 0) -> str:
@@ -750,6 +971,30 @@ def validate_profile(profile: Profile, args: argparse.Namespace) -> None:
         raise ValueError("preflight memory and disk limits must be positive")
     if args.warn_free_disk_gib < args.min_free_disk_gib:
         raise ValueError("warn_free_disk_gib cannot be lower than min_free_disk_gib")
+    if args.run_id and args.run_mode == "resume-latest":
+        raise ValueError("run_id cannot be combined with run_mode=resume-latest")
+    if args.autotune_max_inference_batch < 1 or args.autotune_max_train_batch < 2:
+        raise ValueError("autotune batch limits are outside their safe ranges")
+    if args.autotune_memory_reserve_gib <= 0:
+        raise ValueError("autotune_memory_reserve_gib must be positive")
+    if not 0.1 <= args.autotune_memory_utilization <= 0.95:
+        raise ValueError("autotune_memory_utilization must be between 0.1 and 0.95")
+    if args.autotune_train_batch and args.autotune_mode != "aggressive":
+        raise ValueError("autotune_train_batch=true requires autotune_mode=aggressive")
+    if args.memory_guard_interval_steps < 1:
+        raise ValueError("memory_guard_interval_steps must be at least 1")
+    if args.emergency_available_memory_gib <= 0:
+        raise ValueError("emergency_available_memory_gib must be positive")
+    if args.max_process_rss_gib is not None and args.max_process_rss_gib <= 0:
+        raise ValueError("max_process_rss_gib must be positive or auto")
+    if args.emergency_available_memory_gib >= args.min_available_memory_gib:
+        raise ValueError(
+            "emergency_available_memory_gib must be lower than min_available_memory_gib"
+        )
+    if args.baseline_protection and args.skip_base_eval:
+        raise ValueError("baseline_protection requires skip_base_eval=false")
+    if args.min_validation_gain < 0:
+        raise ValueError("min_validation_gain cannot be negative")
 
 
 def configure_runtime(threads: int, seed: int, logger: logging.Logger) -> int:
@@ -835,6 +1080,208 @@ def preflight(
         )
     if not bool(report["cpu_has_avx2"]):
         logger.warning("AVX2 was not detected; CPU training will be substantially less efficient.")
+
+
+def apply_adaptive_resource_plan(
+    profile: Profile,
+    args: argparse.Namespace,
+    report: Mapping[str, Any],
+    output: Path,
+    logger: logging.Logger,
+) -> tuple[Profile, dict[str, Any]]:
+    """Increase only resource/throughput settings that are safe by default.
+
+    Safe mode never changes epochs, learning rates, sequence length, trainable
+    layers, loss settings, mining semantics, or the physical training batch.
+    Aggressive mode may raise the physical training batch only when explicitly
+    enabled, which can change optimization behavior and therefore is opt-in.
+    """
+
+    persisted_path = output / "autotune.json"
+    if persisted_path.exists():
+        persisted = _read_json(persisted_path)
+        if persisted and isinstance(persisted.get("resolved"), dict):
+            resolved = persisted["resolved"]
+            args.eval_batch_size = int(resolved["eval_batch_size"])
+            args.mining_batch_size = int(resolved["mining_batch_size"])
+            args.mining_chunk_size = int(resolved["mining_chunk_size"])
+            args.eval_corpus_chunk_size = int(resolved["eval_corpus_chunk_size"])
+            profile = dataclasses.replace(profile, batch_size=int(resolved["train_batch_size"]))
+            logger.info("Reusing persisted adaptive resource plan from %s", persisted_path)
+            return profile, persisted
+
+    before = {
+        "train_batch_size": profile.batch_size,
+        "eval_batch_size": args.eval_batch_size,
+        "mining_batch_size": args.mining_batch_size,
+        "mining_chunk_size": args.mining_chunk_size,
+        "eval_corpus_chunk_size": args.eval_corpus_chunk_size,
+        "threads": args.threads,
+        "dataloader_num_workers": args.dataloader_num_workers,
+    }
+    selected = dict(before)
+    reasons: list[str] = []
+    quality_sensitive_changes: list[str] = []
+
+    if args.autotune:
+        available = float(report["memory_available_gib"])
+        reserve = max(
+            float(args.autotune_memory_reserve_gib),
+            float(args.min_available_memory_gib),
+        )
+        usable_budget = max(0.0, available - reserve) * float(args.autotune_memory_utilization)
+
+        if usable_budget >= 12.0:
+            inference_cap = 128
+        elif usable_budget >= 8.0:
+            inference_cap = 96
+        elif usable_budget >= 4.0:
+            inference_cap = 64
+        elif usable_budget >= 2.0:
+            inference_cap = 32
+        else:
+            inference_cap = 16
+        inference_cap = max(1, min(inference_cap, args.autotune_max_inference_batch))
+
+        selected["eval_batch_size"] = min(
+            args.autotune_max_inference_batch,
+            inference_cap,
+        )
+        selected["mining_batch_size"] = min(
+            args.autotune_max_inference_batch,
+            inference_cap,
+        )
+        selected["mining_chunk_size"] = min(
+            4096,
+            max(256, selected["mining_batch_size"] * 8),
+        )
+        selected["eval_corpus_chunk_size"] = max(
+            before["eval_corpus_chunk_size"],
+            min(max(profile.eval_corpus, before["eval_corpus_chunk_size"]), 20_000),
+        )
+        reasons.append(
+            f"safe inference/mining scaling used {usable_budget:.2f} GiB adaptive budget "
+            f"while reserving at least {reserve:.2f} GiB"
+        )
+
+        if args.autotune_mode == "aggressive" and args.autotune_train_batch:
+            if usable_budget >= 12.0:
+                train_cap = 96
+            elif usable_budget >= 8.0:
+                train_cap = 80
+            elif usable_budget >= 5.0:
+                train_cap = 64
+            elif usable_budget >= 3.0:
+                train_cap = 48
+            else:
+                train_cap = 32
+            train_cap = max(2, min(train_cap, args.autotune_max_train_batch))
+            if train_cap > profile.batch_size:
+                selected["train_batch_size"] = train_cap
+                quality_sensitive_changes.append("train_batch_size")
+                reasons.append(
+                    "aggressive mode raised the physical training batch; validation gates and "
+                    "baseline protection remain active, but identical accuracy cannot be guaranteed"
+                )
+
+    args.eval_batch_size = int(selected["eval_batch_size"])
+    args.mining_batch_size = int(selected["mining_batch_size"])
+    args.mining_chunk_size = int(selected["mining_chunk_size"])
+    args.eval_corpus_chunk_size = int(selected["eval_corpus_chunk_size"])
+    profile = dataclasses.replace(profile, batch_size=int(selected["train_batch_size"]))
+
+    payload = {
+        "enabled": bool(args.autotune),
+        "mode": args.autotune_mode,
+        "before": before,
+        "resolved": selected,
+        "quality_sensitive_changes": quality_sensitive_changes,
+        "quality_preserving_safe_mode": not quality_sensitive_changes,
+        "reasons": reasons,
+        "memory": {
+            "available_gib": float(report["memory_available_gib"]),
+            "reserve_gib": float(args.autotune_memory_reserve_gib),
+            "utilization": float(args.autotune_memory_utilization),
+        },
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    atomic_write_json(persisted_path, payload)
+    logger.info(
+        "Adaptive plan: train_batch=%d eval_batch=%d mining_batch=%d mining_chunk=%d mode=%s",
+        profile.batch_size,
+        args.eval_batch_size,
+        args.mining_batch_size,
+        args.mining_chunk_size,
+        args.autotune_mode if args.autotune else "disabled",
+    )
+    return profile, payload
+
+
+class ResourceGuardCallback(TrainerCallback):
+    """Request a checkpoint and graceful stop before system memory is exhausted."""
+
+    def __init__(
+        self,
+        output_path: Path,
+        logger: logging.Logger,
+        interval_steps: int,
+        emergency_available_memory_gib: float,
+        max_process_rss_gib: float | None,
+    ) -> None:
+        self.output_path = output_path
+        self.logger = logger
+        self.interval_steps = max(1, interval_steps)
+        self.emergency_available_memory_gib = emergency_available_memory_gib
+        self.max_process_rss_gib = max_process_rss_gib
+        self.process = psutil.Process(os.getpid())
+        self.triggered = False
+        self.last_snapshot: dict[str, Any] | None = None
+
+    def _check(self, state: Any, control: Any, event: str) -> Any:
+        if self.triggered:
+            control.should_save = True
+            control.should_training_stop = True
+            return control
+        global_step = int(getattr(state, "global_step", 0) or 0)
+        if event == "step" and global_step % self.interval_steps != 0:
+            return control
+
+        memory = psutil.virtual_memory()
+        rss_gib = self.process.memory_info().rss / 2**30
+        available_gib = memory.available / 2**30
+        snapshot = {
+            "event": event,
+            "global_step": global_step,
+            "available_memory_gib": round(available_gib, 3),
+            "process_rss_gib": round(rss_gib, 3),
+            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        self.last_snapshot = snapshot
+        low_available = available_gib < self.emergency_available_memory_gib
+        rss_exceeded = (
+            self.max_process_rss_gib is not None and rss_gib > self.max_process_rss_gib
+        )
+        if low_available or rss_exceeded:
+            self.triggered = True
+            snapshot["reason"] = (
+                "low_available_memory" if low_available else "process_rss_limit_exceeded"
+            )
+            atomic_write_json(self.output_path, snapshot)
+            self.logger.error(
+                "Memory guard requested a safe checkpoint/stop: available=%.2f GiB rss=%.2f GiB reason=%s",
+                available_gib,
+                rss_gib,
+                snapshot["reason"],
+            )
+            control.should_save = True
+            control.should_training_stop = True
+        return control
+
+    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        return self._check(state, control, "step")
+
+    def on_evaluate(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        return self._check(state, control, "evaluate")
 
 
 def transformer_module(model: SentenceTransformer) -> Any:
@@ -1432,6 +1879,10 @@ def train_stage(
     early_stopping_patience: int,
     early_stopping_threshold: float,
     load_best_model_at_end: bool,
+    memory_guard: bool,
+    memory_guard_interval_steps: int,
+    emergency_available_memory_gib: float,
+    max_process_rss_gib: float | None,
     logger: logging.Logger,
 ) -> tuple[SentenceTransformer, dict[str, Any]]:
     checkpoint_dir = output / "checkpoints" / stage_name
@@ -1475,6 +1926,16 @@ def train_stage(
     )
 
     callbacks: list[Any] = []
+    resource_guard: ResourceGuardCallback | None = None
+    if memory_guard:
+        resource_guard = ResourceGuardCallback(
+            output_path=output / "reports" / f"{stage_name}_memory_guard.json",
+            logger=logger,
+            interval_steps=memory_guard_interval_steps,
+            emergency_available_memory_gib=emergency_available_memory_gib,
+            max_process_rss_gib=max_process_rss_gib,
+        )
+        callbacks.append(resource_guard)
     early_stopping_active = bool(early_stopping and epochs > 1.0)
     if early_stopping_active:
         callbacks.append(
@@ -1524,7 +1985,12 @@ def train_stage(
     trainer.save_model(str(model_dir))
     trainer.save_state()
     completed_epochs = float(trainer.state.epoch or 0.0)
-    stopped_early = bool(early_stopping_active and completed_epochs + 1e-6 < epochs)
+    resource_stopped = bool(resource_guard and resource_guard.triggered)
+    stopped_early = bool(
+        early_stopping_active
+        and not resource_stopped
+        and completed_epochs + 1e-6 < epochs
+    )
     summary = {
         "stage": stage_name,
         "rows": len(train_frame),
@@ -1550,6 +2016,13 @@ def train_stage(
         ),
         "best_model_checkpoint": trainer.state.best_model_checkpoint,
         "load_best_model_at_end": load_best_model_at_end,
+        "memory_guard": {
+            "enabled": memory_guard,
+            "triggered": bool(resource_guard and resource_guard.triggered),
+            "last_snapshot": resource_guard.last_snapshot if resource_guard else None,
+            "emergency_available_memory_gib": emergency_available_memory_gib,
+            "max_process_rss_gib": max_process_rss_gib,
+        },
         "duration_seconds": duration,
         "global_step": int(trainer.state.global_step),
         "training_loss": float(result.training_loss),
@@ -1572,6 +2045,11 @@ def train_stage(
         summary["training_loss"],
         duration,
     )
+    if resource_stopped:
+        raise ResourceStopRequested(
+            f"{stage_name} was safely paused by the memory guard after saving state. "
+            "Free memory or lower the relevant batch sizes, then rerun the same command to resume."
+        )
     return model, summary
 
 
@@ -1731,6 +2209,9 @@ def report_markdown(payload: Mapping[str, Any]) -> str:
     dataset = payload["dataset"]
     profile = payload["profile"]
     system = payload["system"]
+    run_config = payload.get("run_config", {})
+    run_info = run_config.get("run", {})
+    autotune = run_config.get("autotune", {})
     final_test = payload.get("final_test_detailed", {})
     dim_metrics = final_test.get("dimensions", {})
     rows = []
@@ -1745,6 +2226,8 @@ def report_markdown(payload: Mapping[str, Any]) -> str:
 ## Run
 
 - Script version: `{SCRIPT_VERSION}`
+- Run ID: `{run_info.get('run_id', 'unknown')}`
+- Run directory: `{run_info.get('run_directory', 'unknown')}`
 - Base model: `{payload['base_model']}`
 - Profile: `{profile['name']}`
 - Train rows: `{dataset['split_rows']['train']}`
@@ -1752,7 +2235,11 @@ def report_markdown(payload: Mapping[str, Any]) -> str:
 - Test rows: `{dataset['split_rows']['test']}`
 - Trainable encoder layers: `{profile['trainable_layers']}`
 - Maximum sequence length: `{profile['max_seq_length']}`
-- Batch size: `{profile['batch_size']}`
+- Physical training batch size: `{profile['batch_size']}`
+- Stage-1 maximum epochs: `{profile['stage1_epochs']}`
+- Stage-2 maximum epochs: `{profile['stage2_epochs']}`
+- Adaptive mode: `{autotune.get('mode', 'disabled')}`
+- Adaptive quality-sensitive changes: `{autotune.get('quality_sensitive_changes', [])}`
 - Selected validation stage: `{payload.get('selected_stage', 'unknown')}`
 - CPU BF16 autocast: `{payload.get('bf16_cpu_amp', False)}`
 
@@ -1820,22 +2307,118 @@ def clean_completed_artifacts(output: Path, keep_intermediate: bool, keep_checkp
             logger.info("Removed intermediate stage-1 model to save disk")
 
 
+def promote_validation_winner(
+    output: Path,
+    candidate_metrics: Mapping[str, Mapping[str, float]],
+    primary_metric: str,
+    baseline_protection: bool,
+    minimum_validation_gain: float,
+    base_model_source: str,
+    max_seq_length: int,
+    offline: bool,
+    logger: logging.Logger,
+) -> tuple[str, dict[str, float]]:
+    scores: dict[str, float] = {}
+    for name, metrics in candidate_metrics.items():
+        if primary_metric not in metrics:
+            continue
+        value = float(metrics[primary_metric])
+        if not math.isfinite(value):
+            raise RuntimeError(f"Validation metric {primary_metric!r} for {name} is not finite")
+        scores[name] = value
+
+    trained_scores = {name: score for name, score in scores.items() if name != "base"}
+    if not trained_scores:
+        raise RuntimeError("No trained candidate has a usable validation score")
+    selected = max(trained_scores, key=trained_scores.get)
+
+    if baseline_protection:
+        if "base" not in scores:
+            raise RuntimeError("Baseline protection is enabled but base validation metrics are missing")
+        required = scores["base"] + minimum_validation_gain
+        if trained_scores[selected] < required:
+            logger.warning(
+                "Quality gate rejected trained candidates: best=%s %.6f required>=%.6f; promoting base model",
+                selected,
+                trained_scores[selected],
+                required,
+            )
+            selected = "base"
+
+    final_dir = output / "models" / "final"
+    if final_dir.exists():
+        shutil.rmtree(final_dir)
+    if selected == "base":
+        base_model = SentenceTransformer(
+            base_model_source,
+            device="cpu",
+            local_files_only=offline,
+        )
+        base_model.max_seq_length = max_seq_length
+        base_model.save(str(final_dir))
+        del base_model
+        gc.collect()
+    else:
+        clone_model_tree(output / "models" / selected, final_dir, logger)
+
+    logger.info(
+        "Validation selection: metric=%s scores=%s selected=%s baseline_protection=%s",
+        primary_metric,
+        {key: round(value, 6) for key, value in scores.items()},
+        selected,
+        baseline_protection,
+    )
+    return selected, scores
+
+
 def main() -> int:
     args = parse_args()
     profile = profile_with_overrides(args)
     validate_profile(profile, args)
     if args.print_config:
-        print(json.dumps(effective_configuration_preview(args, profile), indent=2, sort_keys=True))
+        preview = effective_configuration_preview(args, profile)
+        preview["run_directory_policy"] = {
+            "output_root": str(args.output_root),
+            "exact_output_override": str(args.output) if args.output else None,
+            "run_mode": args.run_mode,
+            "timestamp_format": "YYYYMMDDTHHMMSSZ_profile[_label]",
+            "completed_runs_are_never_reused": True,
+        }
+        print(json.dumps(preview, indent=2, sort_keys=True))
         return 0
-    output = args.output.resolve()
+
+    configured_invocation = invocation_configuration(args, profile)
+    context = resolve_run_context(args, profile)
+    output = context.output
     if args.overwrite_output and output.exists():
         protected = {Path("/").resolve(), Path.home().resolve(), Path.cwd().resolve()}
         if output in protected:
             raise RuntimeError(f"Refusing to delete protected output path: {output}")
         shutil.rmtree(output)
+        output.mkdir(parents=True, exist_ok=True)
+        context = dataclasses.replace(context, resumed=False)
+
     logger = configure_logging(output)
     logger.info("Configuration file: %s", LOADED_ENV_FILE or "none (built-in defaults and shell/CLI only)")
     logger.info("Selected profile: %s", profile.name)
+    logger.info("Run directory: %s (%s)", output, "resumed" if context.resumed else "new")
+    if args.create_latest_links:
+        update_run_links(context, completed=False)
+    atomic_write_json(
+        output / "run_manifest.json",
+        {
+            "run_id": context.run_id,
+            "run_directory": str(output),
+            "output_root": str(context.root),
+            "resumed": context.resumed,
+            "exact_output_override": context.exact_output_override,
+            "invocation_fingerprint": context.invocation_fingerprint,
+            "configured_invocation": configured_invocation,
+            "status": "initializing",
+            "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        },
+    )
+
     configured_threads = configure_runtime(args.threads, args.seed, logger)
     system = system_report(output, configured_threads)
     preflight(
@@ -1845,8 +2428,33 @@ def main() -> int:
         warn_free_disk_gib=args.warn_free_disk_gib,
         logger=logger,
     )
+    profile, autotune_report = apply_adaptive_resource_plan(
+        profile=profile,
+        args=args,
+        report=system,
+        output=output,
+        logger=logger,
+    )
+    validate_profile(profile, args)
     use_bf16 = bool(system["cpu_has_bf16"]) if args.bf16 is None else bool(args.bf16)
     logger.info("CPU BF16 autocast: %s", "enabled" if use_bf16 else "disabled")
+
+    atomic_write_json(
+        output / "run_manifest.json",
+        {
+            "run_id": context.run_id,
+            "run_directory": str(output),
+            "output_root": str(context.root),
+            "resumed": context.resumed,
+            "exact_output_override": context.exact_output_override,
+            "invocation_fingerprint": context.invocation_fingerprint,
+            "configured_invocation": configured_invocation,
+            "resolved_invocation": invocation_configuration(args, profile),
+            "autotune": autotune_report,
+            "status": "running",
+            "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        },
+    )
 
     data_path = discover_data_file(args.data, output / "working", logger)
     splits, dataset_meta = prepare_dataset(
@@ -1864,8 +2472,19 @@ def main() -> int:
     )
     run_config = {
         "script_version": SCRIPT_VERSION,
+        "run": {
+            "run_id": context.run_id,
+            "run_directory": str(output),
+            "output_root": str(context.root),
+        },
         "base_model": args.base_model,
         "profile": dataclasses.asdict(profile),
+        "autotune": {
+            "enabled": bool(args.autotune),
+            "mode": args.autotune_mode,
+            "resolved": autotune_report.get("resolved", {}),
+            "quality_sensitive_changes": autotune_report.get("quality_sensitive_changes", []),
+        },
         "dataset": {
             "source_sha256": dataset_meta["cache_key"]["source_sha256"],
             "boilerplate_threshold": args.boilerplate_threshold,
@@ -1902,6 +2521,8 @@ def main() -> int:
             "early_stopping_patience": args.early_stopping_patience,
             "early_stopping_threshold": args.early_stopping_threshold,
             "load_best_model_at_end": args.load_best_model_at_end,
+            "baseline_protection": args.baseline_protection,
+            "minimum_validation_gain": args.min_validation_gain,
         },
         "hard_negative_mining": {
             "minimum_margin": args.min_hard_negative_margin,
@@ -1917,6 +2538,12 @@ def main() -> int:
             "min_free_disk_gib": args.min_free_disk_gib,
             "warn_free_disk_gib": args.warn_free_disk_gib,
         },
+        "memory_guard": {
+            "enabled": args.memory_guard,
+            "interval_steps": args.memory_guard_interval_steps,
+            "emergency_available_memory_gib": args.emergency_available_memory_gib,
+            "max_process_rss_gib": args.max_process_rss_gib,
+        },
         "loss": {
             "scale": args.loss_scale,
             "matryoshka_weights": list(args.matryoshka_weights),
@@ -1926,7 +2553,7 @@ def main() -> int:
     resume_config = {
         key: value
         for key, value in run_config.items()
-        if key not in {"preflight"}
+        if key not in {"preflight", "run"}
     }
     atomic_write_json(
         output / "run_config.json",
@@ -1970,6 +2597,17 @@ def main() -> int:
                 selected_stage,
             )
             clone_model_tree(selected_model_dir, final_model_dir, logger)
+        elif selected_stage == "base":
+            logger.warning("Final model directory is missing; restoring the recorded base-model winner")
+            base_model = SentenceTransformer(
+                args.base_model,
+                device="cpu",
+                local_files_only=args.offline,
+            )
+            base_model.max_seq_length = profile.max_seq_length
+            base_model.save(str(final_model_dir))
+            del base_model
+            gc.collect()
         else:
             logger.warning(
                 "Run state marks training complete, but neither the final model nor the selected intermediate model exists; "
@@ -2015,6 +2653,7 @@ def main() -> int:
 
     stage_summaries: dict[str, Any] = {}
     stage_validation_metrics: dict[str, dict[str, float]] = {}
+    base_validation_metrics = _read_json(output / "reports" / "base_validation.json") or {}
     for completed_stage in ("stage1", "stage2"):
         stage_report = output / "reports" / f"{completed_stage}.json"
         if stage_report.exists():
@@ -2055,13 +2694,16 @@ def main() -> int:
                 logger=logger,
             )
             if not args.skip_base_eval:
-                base_metrics = evaluate_bundle(
+                base_validation_metrics = evaluate_bundle(
                     model,
                     validation_bundle,
                     output / "evaluation" / "base",
                     logger,
                 )
-                atomic_write_json(output / "reports" / "base_validation.json", base_metrics)
+                atomic_write_json(
+                    output / "reports" / "base_validation.json",
+                    base_validation_metrics,
+                )
 
             model, stage1_summary = train_stage(
                 stage_name="stage1",
@@ -2097,6 +2739,10 @@ def main() -> int:
                 early_stopping_patience=args.early_stopping_patience,
                 early_stopping_threshold=args.early_stopping_threshold,
                 load_best_model_at_end=args.load_best_model_at_end,
+                memory_guard=args.memory_guard,
+                memory_guard_interval_steps=args.memory_guard_interval_steps,
+                emergency_available_memory_gib=args.emergency_available_memory_gib,
+                max_process_rss_gib=args.max_process_rss_gib,
                 logger=logger,
             )
             stage_summaries["stage1"] = stage1_summary
@@ -2168,6 +2814,10 @@ def main() -> int:
                 early_stopping_patience=args.early_stopping_patience,
                 early_stopping_threshold=args.early_stopping_threshold,
                 load_best_model_at_end=args.load_best_model_at_end,
+                memory_guard=args.memory_guard,
+                memory_guard_interval_steps=args.memory_guard_interval_steps,
+                emergency_available_memory_gib=args.emergency_available_memory_gib,
+                max_process_rss_gib=args.max_process_rss_gib,
                 logger=logger,
             )
             stage_summaries["stage2"] = stage2_summary
@@ -2181,40 +2831,22 @@ def main() -> int:
             atomic_write_json(output / "reports" / "stage2_validation.json", stage2_validation)
 
             primary_metric = str(validation_bundle.evaluator.primary_metric)
-            missing_metric_stages = [
-                stage_name
-                for stage_name, metrics in (
-                    ("stage1", stage_validation_metrics["stage1"]),
-                    ("stage2", stage2_validation),
-                )
-                if primary_metric not in metrics
-            ]
-            if missing_metric_stages:
-                available = {
-                    "stage1": sorted(stage_validation_metrics["stage1"].keys()),
-                    "stage2": sorted(stage2_validation.keys()),
-                }
-                raise RuntimeError(
-                    f"Validation metric {primary_metric!r} is missing for {missing_metric_stages}. "
-                    f"Available metrics: {available}"
-                )
-            stage1_score = float(stage_validation_metrics["stage1"][primary_metric])
-            stage2_score = float(stage2_validation[primary_metric])
-            if not math.isfinite(stage1_score) or not math.isfinite(stage2_score):
-                raise RuntimeError(
-                    f"Validation metric {primary_metric!r} must be finite: "
-                    f"stage1={stage1_score}, stage2={stage2_score}"
-                )
-            selected_stage = "stage2" if stage2_score >= stage1_score else "stage1"
-            selected_source = output / "models" / selected_stage
-            final_dir = output / "models" / "final"
-            clone_model_tree(selected_source, final_dir, logger)
-            logger.info(
-                "Validation selection: metric=%s stage1=%.6f stage2=%.6f selected=%s",
-                primary_metric,
-                stage1_score,
-                stage2_score,
-                selected_stage,
+            candidate_metrics: dict[str, Mapping[str, float]] = {
+                "stage1": stage_validation_metrics["stage1"],
+                "stage2": stage2_validation,
+            }
+            if base_validation_metrics:
+                candidate_metrics["base"] = base_validation_metrics
+            selected_stage, selection_scores = promote_validation_winner(
+                output=output,
+                candidate_metrics=candidate_metrics,
+                primary_metric=primary_metric,
+                baseline_protection=args.baseline_protection,
+                minimum_validation_gain=args.min_validation_gain,
+                base_model_source=args.base_model,
+                max_seq_length=profile.max_seq_length,
+                offline=args.offline,
+                logger=logger,
             )
             if not args.keep_intermediate:
                 shutil.rmtree(output / "models" / "stage2", ignore_errors=True)
@@ -2222,14 +2854,31 @@ def main() -> int:
             state["stage2_completed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
             state["selected_stage"] = selected_stage
             state["selection_metric"] = primary_metric
-            state["selection_scores"] = {"stage1": stage1_score, "stage2": stage2_score}
+            state["selection_scores"] = selection_scores
+            state["baseline_protection"] = args.baseline_protection
             atomic_write_json(state_path, state)
         elif not state.get("stage2_complete"):
-            final_dir = output / "models" / "final"
-            clone_model_tree(output / "models" / "stage1", final_dir, logger)
+            primary_metric = str(validation_bundle.evaluator.primary_metric)
+            candidate_metrics = {"stage1": stage_validation_metrics["stage1"]}
+            if base_validation_metrics:
+                candidate_metrics["base"] = base_validation_metrics
+            selected_stage, selection_scores = promote_validation_winner(
+                output=output,
+                candidate_metrics=candidate_metrics,
+                primary_metric=primary_metric,
+                baseline_protection=args.baseline_protection,
+                minimum_validation_gain=args.min_validation_gain,
+                base_model_source=args.base_model,
+                max_seq_length=profile.max_seq_length,
+                offline=args.offline,
+                logger=logger,
+            )
             state["stage2_complete"] = True
             state["stage2_skipped"] = True
-            state["selected_stage"] = "stage1"
+            state["selected_stage"] = selected_stage
+            state["selection_metric"] = primary_metric
+            state["selection_scores"] = selection_scores
+            state["baseline_protection"] = args.baseline_protection
             atomic_write_json(state_path, state)
 
     # Reload the standalone final model before final evaluation.
@@ -2291,7 +2940,21 @@ def main() -> int:
     state["completed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     atomic_write_json(state_path, state)
     clean_completed_artifacts(output, args.keep_intermediate, args.keep_checkpoints, logger)
-    logger.info("Training pipeline complete. Final model: %s", output / "models" / "final")
+    manifest = _read_json(output / "run_manifest.json") or {}
+    manifest.update(
+        {
+            "status": "completed",
+            "completed_at": state["completed_at"],
+            "selected_stage": state.get("selected_stage"),
+            "final_model": str(output / "models" / "final"),
+            "final_report": str(output / "reports" / "final_report.md"),
+        }
+    )
+    atomic_write_json(output / "run_manifest.json", manifest)
+    if args.create_latest_links:
+        update_run_links(context, completed=True)
+    logger.info("Training pipeline complete. Run: %s", output)
+    logger.info("Final model: %s", output / "models" / "final")
     logger.info("Report: %s", output / "reports" / "final_report.md")
     return 0
 
@@ -2299,6 +2962,9 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except ResourceStopRequested as exc:
+        print(f"Resource guard: {exc}", file=sys.stderr)
+        raise SystemExit(75) from exc
     except KeyboardInterrupt:
         print("\nTraining interrupted. Re-run with --resume to continue from the latest saved checkpoint.", file=sys.stderr)
         raise SystemExit(130)

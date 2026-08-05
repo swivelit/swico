@@ -12,102 +12,185 @@ The default `vm` profile is designed for:
 - no GPU
 - Debian 13 / Python 3.13
 
-## Professional configuration model
+## Epoch controls
 
-All operational settings and training hyperparameters are exposed in:
+The maximum epoch caps are controlled by:
+
+```text
+SWICO_STAGE1_EPOCHS
+SWICO_STAGE2_EPOCHS
+```
+
+With `auto`, the selected profile supplies the values:
+
+- `smoke`: stage 1 = 1, stage 2 = 0
+- `vm`: stage 1 = 5, stage 2 = 4
+- `full`: stage 1 = 5, stage 2 = 4
+
+These are maximums, not mandatory work. When early stopping is enabled, validation runs at the end of every epoch and training stops after the configured number of non-improving validation evaluations.
+
+```text
+SWICO_EARLY_STOPPING=true
+SWICO_EARLY_STOPPING_PATIENCE=2
+SWICO_EARLY_STOPPING_THRESHOLD=0.001
+SWICO_LOAD_BEST_MODEL_AT_END=true
+```
+
+The best validation checkpoint is restored before a stage model is saved. The test set is not used for stopping or model selection.
+
+## Timestamped run directories
+
+The default output root is:
+
+```text
+training_artifacts/e5-small-swico
+```
+
+Every new completed experiment receives its own UTC timestamped directory:
+
+```text
+training_artifacts/e5-small-swico/runs/20260805T092530Z_vm/
+```
+
+Optional labels appear at the end:
+
+```text
+SWICO_RUN_LABEL=larger-eval-batch
+```
+
+which creates a name such as:
+
+```text
+20260805T092530Z_vm_larger-eval-batch
+```
+
+The default lifecycle is:
+
+```text
+SWICO_RUN_MODE=auto
+SWICO_RESUME=true
+```
+
+`auto` resumes the newest compatible incomplete run. When the newest compatible run is complete, the next command creates a new timestamped run. Completed runs are never silently reused or deleted.
+
+Convenience links are maintained:
+
+```text
+training_artifacts/e5-small-swico/latest
+training_artifacts/e5-small-swico/latest-completed
+```
+
+Text pointer files are also written for filesystems where symlinks are unavailable.
+
+To force a new run even when an incomplete compatible run exists:
+
+```bash
+SWICO_RUN_MODE=new ./run_vm_training.sh
+```
+
+To require an existing compatible incomplete run:
+
+```bash
+SWICO_RUN_MODE=resume-latest ./run_vm_training.sh
+```
+
+## Safe adaptive tuning
+
+Not every hyperparameter should be increased automatically. Epochs, learning rate, sequence length, trainable layers, loss scale, hard-negative semantics and the physical training batch can change model quality. Increasing all of them is not a valid or accuracy-preserving optimization.
+
+The default planner therefore uses:
+
+```text
+SWICO_AUTOTUNE=true
+SWICO_AUTOTUNE_MODE=safe
+```
+
+Safe mode uses current available RAM and configured reserve to increase only throughput/resource controls that do not change the training objective:
+
+- evaluation encoding batch
+- hard-negative encoding batch
+- mining chunk size
+- evaluation corpus chunk size
+
+It does not alter:
+
+- maximum epochs
+- learning rates
+- sequence length
+- trainable layers
+- loss or Matryoshka settings
+- hard-negative selection thresholds
+- physical training batch
+
+The resolved plan is saved in every run as:
+
+```text
+autotune.json
+```
+
+Aggressive mode may raise the physical training batch:
+
+```text
+SWICO_AUTOTUNE_MODE=aggressive
+SWICO_AUTOTUNE_TRAIN_BATCH=true
+```
+
+This is opt-in because Multiple Negatives Ranking Loss uses the physical batch as the negative set. Changing it may improve or reduce quality; identical accuracy cannot be guaranteed.
+
+## Memory protection
+
+Preflight refuses to start below the configured RAM and disk reserves. During training, a resource callback checks system available memory and process RSS every few optimizer steps:
+
+```text
+SWICO_MEMORY_GUARD=true
+SWICO_MEMORY_GUARD_INTERVAL_STEPS=5
+SWICO_EMERGENCY_AVAILABLE_MEMORY_GIB=4.0
+SWICO_MAX_PROCESS_RSS_GIB=auto
+```
+
+When the emergency threshold is reached, it requests a checkpoint and gracefully pauses the run. Rerunning the same command resumes the compatible timestamped run. This substantially reduces OOM risk, but no userspace program can guarantee survival from a sudden kernel OOM kill or another process consuming all RAM between checks.
+
+## Accuracy protection
+
+The original base model is evaluated on the same validation bundle before fine-tuning. The final candidate is selected from stage 1, stage 2 and the original base model:
+
+```text
+SWICO_BASELINE_PROTECTION=true
+SWICO_MIN_VALIDATION_GAIN=0.0
+```
+
+If every trained candidate is worse than the base validation NDCG, the base model is promoted instead. This protects the measured held-out validation score; it cannot guarantee identical behavior on every unseen real-world query.
+
+## Configuration
+
+All operational controls and hyperparameters are in:
 
 ```text
 training.env
 ```
 
-You should not edit Python source to tune a run.
-
-Configuration precedence is:
+Precedence is:
 
 1. command-line argument
 2. shell environment variable
 3. `training.env`
-4. selected profile default
+4. profile default
 
-Values marked `auto` are inherited from the selected profile. This makes the following command safe even though `training.env` normally selects `vm`:
+Values marked `auto` inherit a profile or automatic decision. Strict mode rejects misspelled `SWICO_` keys.
 
-```bash
-SWICO_PROFILE=smoke ./run_vm_training.sh
-```
-
-The strict configuration loader rejects misspelled `SWICO_` keys, invalid booleans, malformed number lists, unsafe ranges, incompatible split fractions and contradictory early-stopping settings before training starts.
-
-### Edit the configuration
+Edit:
 
 ```bash
 nano training.env
 ```
 
-Save with `Ctrl+O`, press `Enter`, then exit with `Ctrl+X`.
-
-Validate and print the complete effective configuration without reading the dataset or downloading a model:
+Validate without reading the dataset or downloading a model:
 
 ```bash
 ./run_vm_training.sh --print-config
 ```
 
-Use a different configuration file when needed:
-
-```bash
-./run_vm_training.sh --env-file experiments/run-02.env --print-config
-```
-
-## Early stopping and overfitting protection
-
-The previous version did not stop a stage early. It only compared the completed stage-1 and stage-2 models afterward.
-
-Version 3 adds validation-driven early stopping inside both stages:
-
-- validation runs at the end of every epoch
-- the monitored metric is validation cosine NDCG@10
-- `SWICO_EARLY_STOPPING_PATIENCE=2` allows two consecutive validation evaluations without sufficient improvement
-- `SWICO_EARLY_STOPPING_THRESHOLD=0.001` requires an absolute improvement greater than 0.001
-- `SWICO_LOAD_BEST_MODEL_AT_END=true` restores the best checkpoint before the stage model is saved
-- early-stopping callback state is restored when resuming from a checkpoint
-- stage 1 and stage 2 are still compared after training, and the better validation model is promoted to `models/final/`
-- the held-out test split is used only for the final unbiased report, not for stopping or model selection
-
-Early stopping detects a lack of validation improvement; it cannot mathematically prove that every form of overfitting has been eliminated. The combination of component-isolated splits, best-checkpoint restoration, early stopping and stage-level selection is the appropriate safeguard for this pipeline.
-
-Default maximum epochs are intentionally upper bounds rather than mandatory work:
-
-- smoke: stage 1 = 1, stage 2 disabled
-- vm: stage 1 = 5, stage 2 = 4
-- full: stage 1 = 5, stage 2 = 4
-
-Training can finish earlier when the validation metric stops improving.
-
-## Training architecture
-
-The pipeline includes:
-
-- E5 `query: ` and `passage: ` formatting
-- repeated-boilerplate removal and exact-pair deduplication
-- connected-component train/validation/test splitting with zero normalized query, passage or component leakage
-- partial fine-tuning of the final encoder layers
-- no-duplicate batches
-- Multiple Negatives Ranking Loss
-- configurable Matryoshka dimensions and weights
-- stage-1 clean-pair training
-- stage-2 guarded hard-negative curriculum
-- FAISS HNSW candidate retrieval with deterministic fallback
-- validation-based early stopping and best-model restoration
-- validation selection between stage 1 and stage 2
-- bounded retrieval evaluation, confidence calibration and latency reporting
-- resumable checkpoints with callback-state restoration
-- strict run-configuration matching before resume
-- atomic JSON state/report writes
-- disk-efficient final-model hard links with copy fallback
-- completed-checkpoint and intermediate-model cleanup
-
-## Install or upgrade the VM environment
-
-Run inside the extracted repository:
+## Install or upgrade
 
 ```bash
 sudo apt-get update
@@ -116,7 +199,7 @@ chmod +x setup_vm.sh run_vm_training.sh verify_install.py
 ./setup_vm.sh
 ```
 
-It is safe to rerun `./setup_vm.sh` over the existing `.venv`. It installs any new requirement, runs the unit tests and performs an offline compatibility check against the installed Sentence Transformers and Transformers APIs.
+It is safe to rerun over the existing `.venv` and `.hf_cache`.
 
 ## Smoke test
 
@@ -124,126 +207,78 @@ It is safe to rerun `./setup_vm.sh` over the existing `.venv`. It installs any n
 SWICO_PROFILE=smoke ./run_vm_training.sh
 ```
 
-A successful smoke run ends with:
+There is no need to delete the smoke output. The next completed run receives a different timestamped directory.
 
-```text
-Training pipeline complete. Final model: .../models/final
-```
-
-Remove only the smoke output before the real run:
+Inspect the newest run:
 
 ```bash
-rm -rf training_artifacts/e5-small-swico
+cat training_artifacts/e5-small-swico/latest/reports/final_report.md
 ```
 
-## Real VM training
-
-Review the effective configuration:
+## Real training
 
 ```bash
-./run_vm_training.sh --print-config
+nohup ./run_vm_training.sh > launcher.log 2>&1 &
 ```
 
-Start in the background:
+Monitor the trainer-owned log inside the active run:
 
 ```bash
-nohup ./run_vm_training.sh > training.log 2>&1 &
+tail -f training_artifacts/e5-small-swico/latest/training.log
 ```
 
-Monitor:
+Check resources:
 
 ```bash
-tail -f training.log
-```
-
-Press `Ctrl+C` to leave the log view. The background training process continues.
-
-Check process, memory and disk:
-
-```bash
-ps aux | grep '[t]rain_vm.py'
 free -h
 df -h /
-du -sh .venv .hf_cache training_artifacts training.log 2>/dev/null
+ps aux | grep '[t]rain_vm.py'
 ```
 
-## Resume behavior
-
-Rerun the same command:
-
-```bash
-nohup ./run_vm_training.sh > training.log 2>&1 &
-```
-
-The pipeline resumes from the latest compatible checkpoint. If a training-critical env value changed, it refuses to resume and instructs you to use a new output directory or explicitly overwrite the old run. This prevents mixing checkpoints created with different learning rates, data splits, model layers or loss settings.
-
-For a new experiment, change:
+## Important defaults
 
 ```text
-SWICO_OUTPUT_DIR=training_artifacts/e5-small-swico-run-02
-```
-
-## Important `training.env` controls
-
-Common values:
-
-```text
-SWICO_PROFILE=vm
-SWICO_MAX_TRAIN_ROWS=auto
-SWICO_BATCH_SIZE=auto
-SWICO_MAX_SEQ_LENGTH=auto
-SWICO_TRAINABLE_LAYERS=auto
 SWICO_STAGE1_EPOCHS=auto
 SWICO_STAGE2_EPOCHS=auto
-SWICO_STAGE1_LR=0.00002
-SWICO_STAGE2_LR=0.000008
-SWICO_WEIGHT_DECAY=0.01
-SWICO_WARMUP_RATIO=0.06
 SWICO_EARLY_STOPPING=true
 SWICO_EARLY_STOPPING_PATIENCE=2
-SWICO_EARLY_STOPPING_THRESHOLD=0.001
-SWICO_LOAD_BEST_MODEL_AT_END=true
+SWICO_RUN_MODE=auto
+SWICO_AUTOTUNE_MODE=safe
+SWICO_AUTOTUNE_TRAIN_BATCH=false
+SWICO_MEMORY_GUARD=true
+SWICO_BASELINE_PROTECTION=true
 ```
 
-All supported controls, including split ratios, mining parameters, HNSW settings, loss scale, Matryoshka weights, evaluation sizes, CPU threads and preflight limits, are documented directly in `training.env`.
+## Run outputs
 
-## Outputs
+Each run contains:
 
 ```text
-training_artifacts/e5-small-swico/models/final/
-training_artifacts/e5-small-swico/reports/final_report.md
-training_artifacts/e5-small-swico/reports/final_report.json
-training_artifacts/e5-small-swico/reports/stage1.json
-training_artifacts/e5-small-swico/reports/stage2.json
-training_artifacts/e5-small-swico/run_config.json
-training_artifacts/e5-small-swico/run_state.json
-training_artifacts/e5-small-swico/training.log
+models/final/
+reports/final_report.md
+reports/final_report.json
+reports/stage1.json
+reports/stage2.json
+autotune.json
+run_manifest.json
+run_config.json
+run_state.json
+system.json
+training.log
 ```
 
-Each stage report records:
+## Stop and resume
 
-- maximum and completed epochs
-- whether early stopping occurred
-- monitored validation metric
-- best validation score
-- best checkpoint path
-- training loss and runtime
-- effective batch size
-
-## Stop cleanly
+Stop cleanly:
 
 ```bash
 pkill -INT -f 'train_vm.py'
 ```
 
-Run the same training command again to resume.
-
-## Start over intentionally
-
-Either change `SWICO_OUTPUT_DIR`, or run:
+Resume:
 
 ```bash
-./run_vm_training.sh --overwrite-output
+nohup ./run_vm_training.sh > launcher.log 2>&1 &
 ```
 
-`--overwrite-output` refuses to delete protected paths such as `/`, your home directory or the repository root.
+The `auto` run mode resumes only an incomplete run whose configured training fingerprint matches. A changed learning rate, data split, model layer count or other training-critical value creates a new timestamped experiment instead of mixing incompatible checkpoints.

@@ -53,6 +53,37 @@ class SourceContractTests(unittest.TestCase):
                 self.assertFalse(keywords - parameters, (target, call.lineno))
                 self.assertFalse(parameters - keywords - positional, (target, call.lineno))
 
+    def test_timestamped_runs_and_latest_links_are_wired(self) -> None:
+        self.assertIn("_allocate_unique_timestamped_run", SOURCE)
+        self.assertIn('strftime("%Y%m%dT%H%M%SZ")', SOURCE)
+        self.assertIn('context.root / "latest-completed"', SOURCE)
+        self.assertIn("_latest_compatible_incomplete_run", SOURCE)
+        self.assertIn("completed_runs_are_never_reused", SOURCE)
+
+    def test_safe_autotune_does_not_change_quality_controls(self) -> None:
+        function = next(
+            node
+            for node in TREE.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "apply_adaptive_resource_plan"
+        )
+        segment = ast.get_source_segment(SOURCE, function) or ""
+        self.assertIn("quality_preserving_safe_mode", segment)
+        self.assertIn('args.autotune_mode == "aggressive"', segment)
+        self.assertNotIn("stage1_epochs =", segment)
+        self.assertNotIn("stage2_epochs =", segment)
+        self.assertNotIn("stage1_lr =", segment)
+        self.assertNotIn("stage2_lr =", segment)
+        self.assertNotIn("max_seq_length =", segment)
+        self.assertNotIn("trainable_layers =", segment)
+
+    def test_memory_guard_and_baseline_gate_are_wired(self) -> None:
+        self.assertIn("class ResourceGuardCallback", SOURCE)
+        self.assertIn("control.should_training_stop = True", SOURCE)
+        self.assertIn("ResourceStopRequested", SOURCE)
+        self.assertIn("promote_validation_winner", SOURCE)
+        self.assertIn('selected = "base"', SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,43 +1,34 @@
 # Validation record
 
-## Repository checks completed before packaging
+## Static and repository checks
 
-- Python syntax compilation for `train_vm.py`, `training_config.py`, `verify_install.py` and tests
-- Bash syntax checks for `setup_vm.sh` and `run_vm_training.sh`
-- seven unit/source-contract tests passed
-- strict env-file parsing, shell override precedence, `auto` values, boolean parsing and unknown-key rejection tested
-- function-call keyword contracts checked through the Python AST
-- early-stopping callback, best-model arguments, epoch-aligned save/evaluation strategy and Transformers-v5 warmup compatibility checked in source contracts
-- all 90,162 source rows processed through the updated cleaning and component-isolated splitting path
-- resulting rows: train 45,012; validation 8,750; test 8,751
-- zero exact normalized query, passage and connected-component overlap verified across train, validation and test
-- simulated Transformers-5 argument construction selected float `warmup_steps`, epoch evaluation/saving and validation NDCG best-model selection
+- Python syntax compilation for trainer, configuration, verifier and tests
+- Bash syntax validation for setup and launcher scripts
+- strict env-file parsing and unknown-key rejection
+- AST verification that public function calls match keyword signatures
+- source checks for early stopping and best-model restoration
+- source checks for timestamped run allocation and compatible resume
+- source checks that safe autotuning leaves quality-sensitive settings unchanged
+- source checks for the runtime resource guard and baseline quality gate
 
-## Installation-time checks included in the package
-
-`./setup_vm.sh` now performs the following after dependency installation:
-
-```bash
-python -m unittest discover -s tests -v
-python verify_install.py
-```
-
-`verify_install.py` instantiates the real installed `SentenceTransformerTrainingArguments`, checks the installed trainer's callback support, validates epoch-aligned evaluation and saving, confirms best-model loading and constructs `EarlyStoppingCallback` without downloading a model.
-
-## Required VM validation
+## Runtime checks required on the target VM
 
 Run:
 
 ```bash
+./setup_vm.sh
 SWICO_PROFILE=smoke ./run_vm_training.sh
 ```
 
-The user's previous v2.1.1 smoke run already established that this VM supports CPU BF16 and can train, evaluate, save and reload the E5 model. Version 3 changes configuration and stopping behavior, so one new smoke run is still required before starting the long VM profile.
+The previous v3 smoke log already demonstrated working CPU BF16, training, validation, saving and reload on the target VM. Version 4 changes run allocation, resource planning and quality promotion, so one v4 smoke run is required.
 
-After the smoke test, inspect:
+After completion:
 
 ```bash
-cat training_artifacts/e5-small-swico/reports/stage1.json
+find training_artifacts/e5-small-swico/runs -maxdepth 1 -mindepth 1 -type d -printf '%f\n'
+cat training_artifacts/e5-small-swico/latest/autotune.json
+cat training_artifacts/e5-small-swico/latest/run_manifest.json
+cat training_artifacts/e5-small-swico/latest/reports/final_report.md
 ```
 
-For the one-epoch smoke profile, early stopping is configured but intentionally inactive because there is only one possible validation epoch. The full `vm` profile activates early stopping because its maximum epoch counts are greater than one.
+Run the smoke command a second time. It must create a different timestamped directory rather than reuse the completed first run.

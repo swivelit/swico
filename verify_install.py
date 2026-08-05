@@ -4,18 +4,20 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import tempfile
 from pathlib import Path
 
 from sentence_transformers import SentenceTransformerTrainer
-from transformers import EarlyStoppingCallback
+from transformers import EarlyStoppingCallback, TrainerCallback
 
 import train_vm
 
 
 with tempfile.TemporaryDirectory(prefix="swico-training-verify-") as directory:
+    root = Path(directory)
     args = train_vm.make_training_args(
-        output_dir=Path(directory),
+        output_dir=root / "trainer",
         epochs=3.0,
         batch_size=16,
         eval_batch_size=32,
@@ -47,5 +49,40 @@ with tempfile.TemporaryDirectory(prefix="swico-training-verify-") as directory:
     assert str(args.eval_strategy).lower().endswith("epoch")
     assert str(args.save_strategy).lower().endswith("epoch")
     assert callback.early_stopping_patience == 2
+
+    guard = train_vm.ResourceGuardCallback(
+        output_path=root / "guard.json",
+        logger=logging.getLogger("verify"),
+        interval_steps=5,
+        emergency_available_memory_gib=0.01,
+        max_process_rss_gib=None,
+    )
+    assert isinstance(guard, TrainerCallback)
+
+    parsed = train_vm.parse_args()
+    profile = train_vm.profile_with_overrides(parsed)
+    train_vm.validate_profile(profile, parsed)
+    parsed.output_root = root / "run-root"
+    parsed.output = None
+    parsed.run_mode = "auto"
+    parsed.run_id = None
+    parsed.run_label = "verify"
+
+    first = train_vm.resolve_run_context(parsed, profile)
+    train_vm.atomic_write_json(
+        first.output / "run_manifest.json",
+        {"invocation_fingerprint": first.invocation_fingerprint},
+    )
+    resumed = train_vm.resolve_run_context(parsed, profile)
+    assert resumed.resumed is True
+    assert resumed.output == first.output
+
+    train_vm.atomic_write_json(
+        first.output / "run_state.json",
+        {"final_evaluation_complete": True, "completed_at": "verified"},
+    )
+    second = train_vm.resolve_run_context(parsed, profile)
+    assert second.resumed is False
+    assert second.output != first.output
 
 print("Swico trainer compatibility check passed.")
