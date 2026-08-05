@@ -27,6 +27,14 @@ from torch.optim import AdamW
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
 
+# Maximize PyTorch CPU multi-threading across all 16 vCPU cores
+os.environ["OMP_NUM_THREADS"] = "16"
+os.environ["MKL_NUM_THREADS"] = "16"
+try:
+    torch.set_num_threads(16)
+except Exception:
+    pass
+
 try:
     import faiss
 except ImportError:
@@ -64,29 +72,30 @@ HF_DIR = Path("./e5_small_hf")
 CHECKPOINT_DIR = Path("./e5_small_checkpoints")
 REPORT_PATH = Path("./e5_small_retrieval_report.md")
 
-# Auto-adjust Batch Size for GPU vs High-End CPU
+# Auto-adjust Batch Size & Hard Negatives for GPU vs High-End CPU
 IS_GPU = torch.cuda.is_available()
 if IS_GPU:
     BATCH_SIZE = 256                    # Single-device GPU batch size
     GRADIENT_ACCUMULATION_STEPS = 2     # Effective batch size = 512
+    NUM_HARD_NEGATIVES = 3              # Mined negatives per query for GPU
 else:
-    BATCH_SIZE = 64                     # Optimal CPU per-device batch size to prevent RAM thrashing
-    GRADIENT_ACCUMULATION_STEPS = 8     # Effective batch size = 512
+    BATCH_SIZE = 32                     # High-speed CPU per-device batch size
+    GRADIENT_ACCUMULATION_STEPS = 2     # Effective batch size = 64 (Ideal for CPU threads)
+    NUM_HARD_NEGATIVES = 1              # 1 hard negative per query (keeps data size optimal for CPU speed)
 
-EPOCHS = 200                        # Max Epochs set to 200 (Early Stopping automatically stops when accuracy peaks)
+EPOCHS = 80                         # Max Epochs set to 80 (Early Stopping automatically stops when accuracy peaks)
 LEARNING_RATE = 2.5e-5              # Ideal base learning rate
 WARMUP_RATIO = 0.10                 # 10% warmup ratio for smooth convergence
 WEIGHT_DECAY = 0.05                 # Balanced L2 regularization
-EARLY_STOPPING_PATIENCE = 15        # Checkpoint evaluations to wait before early stopping
+EARLY_STOPPING_PATIENCE = 12        # Checkpoint evaluations to wait before early stopping
 
 # Checkpoint intervals
-EVAL_STEPS = 300
+EVAL_STEPS = 600
 SAVE_STEPS = 600
 
 # Hard Negative Mining Configurations
 MINE_NEGATIVES = True
-NUM_HARD_NEGATIVES = 4              # Increased from 3 to 4 for richer contrastive signal
-LLRD_DECAY_RATE = 0.94              # Layer-wise Learning Rate Decay (0.94)
+LLRD_DECAY_RATE = 0.93              # Layer-wise Learning Rate Decay
 
 if faiss is None and MINE_NEGATIVES:
     print("WARNING: FAISS is not installed. Disabling hard negative mining.")
@@ -533,6 +542,7 @@ def main():
         save_strategy="steps",
         save_steps=SAVE_STEPS,
         save_total_limit=2,                 # Keep only the last 2 checkpoints automatically
+        dataloader_num_workers=4 if not IS_GPU else 0, # Parallel CPU worker threads for fast data loading
         metric_for_best_model="eval_validation_cosine_mrr@5",
         greater_is_better=True,
         load_best_model_at_end=True,
