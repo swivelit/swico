@@ -15,7 +15,7 @@ class QwenSourceContractTests(unittest.TestCase):
         self.assertIn("LoraConfig", SOURCE)
         self.assertIn('task_type="CAUSAL_LM"', SOURCE)
         self.assertIn("assistant_only_tokens", SOURCE)
-        self.assertIn("return_assistant_tokens_mask=True", SOURCE)
+        self.assertIn("SWICO_QWEN_ASSISTANT_BOUNDARY", SOURCE)
         self.assertIn("enable_thinking=False", SOURCE)
 
     def test_conversation_level_split_and_leakage_check_are_wired(self) -> None:

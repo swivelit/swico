@@ -664,50 +664,74 @@ def assistant_only_tokens(tokenizer, messages: list[dict[str, str]], max_seq_len
     """Tokenize a conversation and train only on assistant content tokens.
 
     Qwen3's distributed chat template does not expose Transformers'
-    ``{% generation %}`` spans, so ``return_assistant_tokens_mask=True`` is
-    not reliable.  Instead we render the exact chat text once, derive the
-    character ranges occupied by assistant message content, and map those
-    ranges to token offsets from the fast tokenizer.  This avoids false
-    "conversation truncated" failures caused by template boundary rewrites.
+    ``{% generation %}`` spans consistently.  We therefore inject temporary,
+    unique marker strings around assistant message content, render the chat
+    template exactly once, remove those markers, and convert their positions
+    into character spans.  The markers are never tokenized or trained on.
+
+    This is robust to Qwen adding role headers, thinking wrappers, whitespace,
+    or other template text around assistant replies, and it avoids fragile
+    raw-response searches in the rendered conversation.
     """
-    rendered = str(
+    marker_nonce = "SWICO_QWEN_ASSISTANT_BOUNDARY_7F3A9C"
+    marked_messages: list[dict[str, str]] = []
+    assistant_count = 0
+    for message in messages:
+        cloned = dict(message)
+        content = str(message["content"])
+        if message["role"] == "assistant":
+            start_marker = f"<{marker_nonce}_START_{assistant_count}>"
+            end_marker = f"<{marker_nonce}_END_{assistant_count}>"
+            if start_marker in content or end_marker in content:
+                raise ValueError("Qwen assistant-boundary marker unexpectedly appears in training data")
+            cloned["content"] = f"{start_marker}{content}{end_marker}"
+            assistant_count += 1
+        marked_messages.append(cloned)
+
+    if assistant_count == 0:
+        raise ValueError("A conversation contains no assistant messages")
+
+    marked_rendered = str(
         apply_template(
             tokenizer,
-            messages,
+            marked_messages,
             tokenize=False,
             add_generation_prompt=False,
         )
     )
 
+    clean_parts: list[str] = []
     assistant_spans: list[tuple[int, int]] = []
-    for index, message in enumerate(messages):
-        if message["role"] != "assistant":
-            continue
-
-        # Rendering the preceding turns with add_generation_prompt=True gives
-        # the exact text immediately before this assistant's response.
-        prefix = str(
-            apply_template(
-                tokenizer,
-                messages[:index],
-                tokenize=False,
-                add_generation_prompt=True,
+    source_pos = 0
+    clean_pos = 0
+    for assistant_index in range(assistant_count):
+        start_marker = f"<{marker_nonce}_START_{assistant_index}>"
+        end_marker = f"<{marker_nonce}_END_{assistant_index}>"
+        start_at = marked_rendered.find(start_marker, source_pos)
+        if start_at < 0:
+            raise ValueError(
+                f"Qwen chat template did not preserve assistant start marker {assistant_index}"
             )
-        )
-        content = str(message["content"])
-        start = len(prefix)
+        before = marked_rendered[source_pos:start_at]
+        clean_parts.append(before)
+        clean_pos += len(before)
 
-        # Normal Qwen3 path: assistant content follows the generation prompt
-        # verbatim.  Keep a guarded search fallback for compatible templates
-        # that insert harmless whitespace around the response.
-        if not rendered.startswith(content, start):
-            located = rendered.find(content, max(0, start - 16))
-            if located < 0:
-                raise ValueError(
-                    f"Could not locate assistant response {index} in rendered Qwen chat template"
-                )
-            start = located
-        assistant_spans.append((start, start + len(content)))
+        content_start = start_at + len(start_marker)
+        end_at = marked_rendered.find(end_marker, content_start)
+        if end_at < 0:
+            raise ValueError(
+                f"Qwen chat template did not preserve assistant end marker {assistant_index}"
+            )
+        assistant_text = marked_rendered[content_start:end_at]
+        span_start = clean_pos
+        clean_parts.append(assistant_text)
+        clean_pos += len(assistant_text)
+        assistant_spans.append((span_start, clean_pos))
+        source_pos = end_at + len(end_marker)
+
+    tail = marked_rendered[source_pos:]
+    clean_parts.append(tail)
+    rendered = "".join(clean_parts)
 
     encoded = tokenizer(
         rendered,
@@ -715,23 +739,29 @@ def assistant_only_tokens(tokenizer, messages: list[dict[str, str]], max_seq_len
         return_offsets_mapping=True,
         truncation=False,
     )
-    ids = list(encoded["input_ids"])
+    ids = [int(token_id) for token_id in encoded["input_ids"]]
     offsets = list(encoded["offset_mapping"])
+    if len(ids) != len(offsets):
+        raise ValueError("Tokenizer returned mismatched input_ids and offset_mapping lengths")
+
     labels: list[int] = []
-    for token_id, offset in zip(ids, offsets, strict=False):
+    for token_id, offset in zip(ids, offsets, strict=True):
         token_start, token_end = int(offset[0]), int(offset[1])
         is_assistant = token_end > token_start and any(
             token_start < span_end and token_end > span_start
             for span_start, span_end in assistant_spans
         )
-        labels.append(int(token_id) if is_assistant else -100)
+        labels.append(token_id if is_assistant else -100)
 
+    # Keep the newest context when a conversation exceeds the configured
+    # sequence length.  This mirrors the previous behavior while preserving
+    # assistant-only labels for the retained suffix.
     ids = ids[-max_seq_length:]
     labels = labels[-max_seq_length:]
     if not any(label != -100 for label in labels):
         raise ValueError(
             "A conversation has no assistant response tokens after tokenization/truncation; "
-            "verify the chat template or increase SWICO_QWEN_MAX_SEQ_LENGTH"
+            "increase SWICO_QWEN_MAX_SEQ_LENGTH"
         )
     return ids, labels
 

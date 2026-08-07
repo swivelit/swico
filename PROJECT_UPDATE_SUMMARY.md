@@ -1,65 +1,30 @@
-# Swico dual-model training update
+# Qwen assistant-labeling fix
 
-## Trainers
+This build fixes the Qwen3 smoke-training failure:
 
-- `train_vm.py` — advanced multilingual-E5 retrieval/RAG fine-tuning
-- `qwen_train_vm.py` — advanced Qwen/Qwen3-0.6B conversational LoRA SFT
+`ERROR: Could not locate assistant response 2 in rendered Qwen chat template`
 
-## Data
+## Root cause
 
-- E5: `data/e5_dataset - e5_dataset.csv`
-- Qwen: `data/qwen_dataset - qwen_dataset.csv`
+The previous implementation tried to find each raw assistant response inside the fully rendered Qwen chat string. That is fragile because Qwen3 can add or transform chat-template boundary text around assistant turns.
 
-## First VM setup
+## Fix
 
-```bash
-chmod +x setup_vm.sh run_vm_training.sh run_e5_training.sh run_qwen_training.sh verify_install.py train_vm.py qwen_train_vm.py
-./setup_vm.sh
-```
+`qwen_train_vm.py` now:
 
-## Validate configurations
+- injects temporary unique boundary markers around assistant message content;
+- renders the Qwen chat template only once;
+- removes those temporary markers before tokenization;
+- derives exact assistant character spans from the marker positions;
+- maps those spans through the tokenizer offset mapping;
+- masks all non-assistant tokens with `-100`;
+- never trains on the temporary markers;
+- keeps the existing right-side sequence truncation and final safety check.
 
-```bash
-./run_e5_training.sh --print-config
-./run_qwen_training.sh --print-config
-```
+The markers are used only internally to calculate labels and are absent from the final model input.
 
-## Smoke tests
+## Validation
 
-```bash
-SWICO_PROFILE=smoke ./run_e5_training.sh
-SWICO_QWEN_PROFILE=smoke ./run_qwen_training.sh
-```
-
-## Full VM-profile runs
-
-```bash
-nohup ./run_e5_training.sh > e5-launcher.log 2>&1 &
-nohup ./run_qwen_training.sh > qwen-launcher.log 2>&1 &
-```
-
-Run them one at a time on the same CPU VM to avoid RAM/CPU contention.
-
-## Main outputs
-
-E5:
-
-```text
-training_artifacts/e5-small-swico/latest/models/final/
-training_artifacts/e5-small-swico/latest/reports/final_report.md
-```
-
-Qwen:
-
-```text
-training_artifacts/qwen3-0.6b-swico/latest/models/adapter/
-training_artifacts/qwen3-0.6b-swico/latest/reports/final_report.md
-```
-
-## 2026-08-07 Qwen3 assistant-label regression fix
-
-- Replaced `return_assistant_tokens_mask=True` usage with tokenizer offset-based assistant-content labeling.
-- Prevents false `A conversation was truncated before all assistant response tokens` errors caused by Qwen3 chat-template boundary rewrites.
-- Keeps assistant-only SFT: system/user/template tokens remain masked with `-100`.
-- Qwen smoke profile remains at a 512-token maximum sequence length.
-- Full source-contract/config test suite: 16 tests passing.
+- Full unit-test suite: 17 passed.
+- Added a runtime regression test covering two assistant replies in one conversation.
+- Python compilation check passed.
