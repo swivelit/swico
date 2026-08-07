@@ -1,30 +1,32 @@
-# Qwen assistant-labeling fix
+# Qwen CPU LoRA runtime fixes
 
-This build fixes the Qwen3 smoke-training failure:
+This build includes the earlier multi-turn assistant-labeling fix and adds the runtime fix for the latest smoke-training failure:
 
-`ERROR: Could not locate assistant response 2 in rendered Qwen chat template`
+`AttributeError` from `transformers.generation.utils.generate()` while accessing `inputs_tensor.shape[0]`.
 
-## Root cause
+## Latest root cause
 
-The previous implementation tried to find each raw assistant response inside the fully rendered Qwen chat string. That is fragile because Qwen3 can add or transform chat-template boundary text around assistant turns.
+The Qwen smoke run completed tokenization and LoRA training successfully, then failed during held-out sample generation. Modern Transformers can return a `BatchEncoding` object from `apply_chat_template`. The trainer treated that whole object as `input_ids`, so `model.generate()` received a tokenizer container instead of a PyTorch tensor.
 
-## Fix
+## Latest fix
 
 `qwen_train_vm.py` now:
 
-- injects temporary unique boundary markers around assistant message content;
-- renders the Qwen chat template only once;
-- removes those temporary markers before tokenization;
-- derives exact assistant character spans from the marker positions;
-- maps those spans through the tokenizer offset mapping;
-- masks all non-assistant tokens with `-100`;
-- never trains on the temporary markers;
-- keeps the existing right-side sequence truncation and final safety check.
+- requests `return_dict=True` for generation prompt tokenization;
+- extracts `input_ids` and `attention_mask` from mapping-like `BatchEncoding` outputs;
+- accepts direct tensor/list outputs as a defensive fallback;
+- normalizes generation inputs to 2-D PyTorch tensors;
+- creates an attention mask when the tokenizer does not return one;
+- enables KV cache for inference-only generation;
+- removes `EarlyStoppingCallback` after training and before held-out test evaluation, preventing the misleading `eval_loss` warning caused by the `test_` metric prefix.
 
-The markers are used only internally to calculate labels and are absent from the final model input.
+## Existing assistant-labeling fix retained
+
+The trainer still uses temporary assistant-boundary markers to derive exact assistant-only labels for multi-turn Qwen conversations. Those markers are removed before tokenization and are never trained on.
 
 ## Validation
 
-- Full unit-test suite: 17 passed.
-- Added a runtime regression test covering two assistant replies in one conversation.
+- Full unit-test suite: 20 passed.
+- Runtime regression test verifies a BatchEncoding-like object is unpacked to tensors before `model.generate()`.
+- Multi-turn assistant-labeling regression test remains green.
 - Python compilation check passed.

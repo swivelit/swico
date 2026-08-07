@@ -37,6 +37,15 @@ class QwenSourceContractTests(unittest.TestCase):
     def test_required_csv_columns_are_explicit(self) -> None:
         self.assertIn('"conversation_id", "turn_index", "role", "content", "language"', SOURCE)
 
+    def test_generation_unpacks_batch_encoding_to_tensors(self) -> None:
+        self.assertIn('return_dict=True', SOURCE)
+        self.assertIn('"input_ids" in rendered', SOURCE)
+        self.assertIn('torch.ones_like(input_ids)', SOURCE)
+        self.assertIn('use_cache=True', SOURCE)
+
+    def test_early_stopping_callback_is_removed_before_test_evaluation(self) -> None:
+        self.assertIn('trainer.remove_callback(EarlyStoppingCallback)', SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()

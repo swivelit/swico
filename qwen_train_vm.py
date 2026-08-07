@@ -898,19 +898,37 @@ def generate_samples(
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
+            return_dict=True,
         )
-        if isinstance(rendered, dict):
+
+        # ``apply_chat_template(..., return_dict=True)`` returns a BatchEncoding
+        # in modern Transformers.  BatchEncoding is mapping-like but is not
+        # guaranteed to be a built-in ``dict``; treating the whole object as
+        # ``input_ids`` makes ``generate()`` fail when it accesses ``.shape``.
+        if hasattr(rendered, "keys") and "input_ids" in rendered:
             input_ids = rendered["input_ids"]
             attention_mask = rendered.get("attention_mask")
-        else:
+        elif torch.is_tensor(rendered):
             input_ids = rendered
             attention_mask = None
+        else:
+            input_ids = torch.as_tensor(rendered, dtype=torch.long)
+            attention_mask = None
+
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        elif attention_mask.ndim == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+
         with torch.inference_mode(), torch.autocast("cpu", dtype=torch.bfloat16, enabled=use_bf16):
             generated = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
+                use_cache=True,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
@@ -1053,6 +1071,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger.info("Training Qwen LoRA%s", f" from {checkpoint}" if checkpoint else "")
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     trainer.save_state()
+
+    # Early stopping is a training-only callback.  Held-out evaluation below
+    # uses the ``test_`` metric prefix, so leaving this callback attached makes
+    # Transformers look for ``eval_loss`` during test evaluation and emit a
+    # misleading warning that early stopping was disabled.
+    if args.early_stopping:
+        trainer.remove_callback(EarlyStoppingCallback)
+
     if guard is not None and guard.triggered:
         atomic_write_json(
             output / "run_state.json",
