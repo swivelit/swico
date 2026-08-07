@@ -2470,6 +2470,20 @@ def main() -> int:
         },
         logger=logger,
     )
+    # Tiny smoke/example datasets must still produce at least one retrieval batch.
+    # Keep the configured batch for real datasets; only shrink it when the complete
+    # prepared training split is smaller than the requested physical batch.
+    if len(splits["train"]) < 2:
+        raise RuntimeError("E5 training requires at least 2 prepared training rows")
+    if profile.batch_size > len(splits["train"]):
+        original_batch = profile.batch_size
+        profile = dataclasses.replace(profile, batch_size=max(2, len(splits["train"])))
+        logger.warning(
+            "Reduced E5 physical batch size from %d to %d because the prepared training split has only %d rows",
+            original_batch,
+            profile.batch_size,
+            len(splits["train"]),
+        )
     run_config = {
         "script_version": SCRIPT_VERSION,
         "run": {

@@ -19,3 +19,14 @@
 - Added typed `training.env` and strict validation.
 - Added validation NDCG early stopping and best-model restoration.
 - Added callback-state restoration and incompatible-resume rejection.
+
+## 2026-08-07 — dual-model CPU training
+
+- Kept the advanced multilingual-E5 retrieval trainer and pointed its default data path at the bundled E5 CSV.
+- Added `qwen_train_vm.py` for Qwen/Qwen3-0.6B conversational LoRA SFT.
+- Added conversation-level leakage-resistant splitting and assistant-only causal-LM labels.
+- Added Qwen BF16 detection, gradient accumulation/checkpointing, early stopping, best checkpoint loading, resume, memory guards and held-out evaluation.
+- Added adapter export and optional merged-model export.
+- Added `qwen_training.env`, `qwen_training.env.example`, `run_qwen_training.sh`, and `run_e5_training.sh`.
+- Added PEFT to the CPU requirements and setup verification.
+- Added Qwen source-contract tests and documentation.

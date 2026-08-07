@@ -8,3 +8,4 @@ numpy>=1.26,<3
 psutil>=5.9,<8
 safetensors>=0.5,<1
 python-dotenv>=1.1,<2
+peft>=0.17,<1

@@ -32,3 +32,35 @@ cat training_artifacts/e5-small-swico/latest/reports/final_report.md
 ```
 
 Run the smoke command a second time. It must create a different timestamped directory rather than reuse the completed first run.
+
+## Qwen3-0.6B LoRA checks
+
+Static validation also covers:
+
+- Qwen trainer Python syntax
+- Qwen launcher Bash syntax
+- strict registration of every `SWICO_QWEN_*` environment key
+- conversation-level train/validation/test splitting
+- assistant-only label construction
+- LoRA target configuration
+- early stopping / best model selection
+- resumable timestamped Qwen runs
+- memory guard callback
+- adapter and final-report export paths
+
+Target-VM validation:
+
+```bash
+./setup_vm.sh
+./run_qwen_training.sh --print-config
+SWICO_QWEN_PREPARE_ONLY=true ./run_qwen_training.sh
+SWICO_QWEN_PROFILE=smoke ./run_qwen_training.sh
+```
+
+After the smoke run:
+
+```bash
+cat training_artifacts/qwen3-0.6b-swico/latest/reports/final_report.md
+cat training_artifacts/qwen3-0.6b-swico/latest/run_config.json
+cat training_artifacts/qwen3-0.6b-swico/latest/system.json
+```

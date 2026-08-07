@@ -34,6 +34,7 @@ packages = [
     "numpy",
     "psutil",
     "dotenv",
+    "peft",
 ]
 for package in packages:
     module = importlib.import_module(package)

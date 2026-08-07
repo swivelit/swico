@@ -282,3 +282,149 @@ nohup ./run_vm_training.sh > launcher.log 2>&1 &
 ```
 
 The `auto` run mode resumes only an incomplete run whose configured training fingerprint matches. A changed learning rate, data split, model layer count or other training-critical value creates a new timestamped experiment instead of mixing incompatible checkpoints.
+
+---
+
+# Qwen3-0.6B Conversational Training
+
+The repository also trains `Qwen/Qwen3-0.6B` as the generative conversational half of the Swico stack. E5 remains the retriever; Qwen generates responses.
+
+## Dataset
+
+The bundled conversational dataset is:
+
+```text
+data/qwen_dataset - qwen_dataset.csv
+```
+
+Required CSV columns:
+
+```text
+conversation_id,turn_index,role,content,language
+```
+
+Messages with the same `conversation_id` are grouped into one conversation. Splitting happens at the complete-conversation level so turns from one conversation cannot leak across train, validation and test sets.
+
+## Qwen training method
+
+The Qwen trainer uses:
+
+- Qwen's own chat template
+- normal chat mode (`enable_thinking=false` when supported by the tokenizer)
+- assistant-response-only causal language-model loss
+- LoRA / PEFT rather than full-weight fine-tuning
+- validation loss for early stopping and best-checkpoint restoration
+- held-out test loss and perplexity
+- deterministic held-out sample generations
+- CPU BF16 when the machine supports it
+- gradient accumulation and optional gradient checkpointing
+- timestamped compatible resume
+- memory guard and disk/RAM preflight checks
+
+The default LoRA targets are:
+
+```text
+q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+```
+
+## Qwen configuration
+
+Edit:
+
+```bash
+nano qwen_training.env
+```
+
+Validate configuration without loading the model:
+
+```bash
+./run_qwen_training.sh --print-config
+```
+
+Prepare and validate the dataset without downloading Qwen:
+
+```bash
+SWICO_QWEN_PREPARE_ONLY=true ./run_qwen_training.sh
+```
+
+## Qwen smoke test
+
+```bash
+SWICO_QWEN_PROFILE=smoke ./run_qwen_training.sh
+```
+
+Monitor:
+
+```bash
+tail -f training_artifacts/qwen3-0.6b-swico/latest/training.log
+```
+
+Inspect the report:
+
+```bash
+cat training_artifacts/qwen3-0.6b-swico/latest/reports/final_report.md
+```
+
+## Qwen real training
+
+```bash
+nohup ./run_qwen_training.sh > qwen-launcher.log 2>&1 &
+```
+
+The default `vm` profile is intentionally conservative for an 8-logical-CPU / ~29 GiB RAM VM:
+
+```text
+max conversations = 12000
+epoch cap = 3
+physical batch = 1
+gradient accumulation = 16
+max sequence length = 512
+LoRA rank = 8
+LoRA alpha = 16
+LoRA dropout = 0.05
+```
+
+Early stopping can finish before the epoch cap.
+
+## Qwen outputs
+
+Each Qwen run stores:
+
+```text
+training_artifacts/qwen3-0.6b-swico/runs/<timestamp>_<profile>/
+  models/adapter/
+  prepared/train.jsonl
+  prepared/validation.jsonl
+  prepared/test.jsonl
+  reports/final_report.md
+  reports/final_report.json
+  run_manifest.json
+  run_config.json
+  run_state.json
+  system.json
+  training.log
+```
+
+By default only the LoRA adapter is exported. This is the recommended CPU-VM behavior because it minimizes disk and memory use. To also create a merged standalone Qwen model after training:
+
+```text
+SWICO_QWEN_MERGE_ADAPTER=true
+```
+
+Merging temporarily consumes more RAM.
+
+## Which trainer should I run?
+
+E5 retriever:
+
+```bash
+./run_e5_training.sh
+```
+
+Qwen conversational generator:
+
+```bash
+./run_qwen_training.sh
+```
+
+You should train and evaluate them independently. At application runtime, E5 retrieves relevant context and the fine-tuned Qwen model uses that context to produce the conversational response.

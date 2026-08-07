@@ -86,3 +86,22 @@ with tempfile.TemporaryDirectory(prefix="swico-training-verify-") as directory:
     assert second.output != first.output
 
 print("Swico trainer compatibility check passed.")
+
+# Qwen/PEFT stack contract checks; no model download is performed here.
+from peft import LoraConfig
+import qwen_train_vm
+
+qwen_args = qwen_train_vm.parse_args(["--print-config"])
+qwen_profile = qwen_train_vm.resolve_profile(qwen_args)
+qwen_train_vm.validate_config(qwen_args, qwen_profile)
+qwen_lora = LoraConfig(
+    r=qwen_args.lora_r,
+    lora_alpha=qwen_args.lora_alpha,
+    lora_dropout=qwen_args.lora_dropout,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=list(qwen_args.lora_target_modules),
+)
+assert qwen_lora.r == qwen_args.lora_r
+assert "q_proj" in qwen_args.lora_target_modules
+print("Swico Qwen LoRA trainer compatibility check passed.")

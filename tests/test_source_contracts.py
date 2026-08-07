@@ -84,6 +84,10 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("promote_validation_winner", SOURCE)
         self.assertIn('selected = "base"', SOURCE)
 
+    def test_tiny_example_dataset_can_shrink_training_batch(self) -> None:
+        self.assertIn("Reduced E5 physical batch size", SOURCE)
+        self.assertIn('if len(splits["train"]) < 2', SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()
