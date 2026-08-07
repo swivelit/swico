@@ -104,7 +104,7 @@ class Profile:
 
 
 PROFILES: dict[str, Profile] = {
-    "smoke": Profile("smoke", 64, 1.0, 1, 4, 256, 1),
+    "smoke": Profile("smoke", 64, 1.0, 1, 4, 512, 1),
     "vm": Profile("vm", 12_000, 3.0, 1, 16, 512, 3),
     "full": Profile("full", None, 3.0, 1, 16, 768, 5),
 }
@@ -661,23 +661,28 @@ def apply_template(tokenizer, messages: list[dict[str, str]], *, tokenize: bool,
 
 
 def assistant_only_tokens(tokenizer, messages: list[dict[str, str]], max_seq_length: int) -> tuple[list[int], list[int]]:
-    # Preferred path: use tokenizer-provided assistant mask when its template exposes one.
-    with contextlib.suppress(Exception):
-        encoded = apply_template(
-            tokenizer,
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
-            return_dict=True,
-            return_assistant_tokens_mask=True,
-        )
-        ids = list(encoded["input_ids"])
-        mask = encoded.get("assistant_masks") or encoded.get("assistant_tokens_mask")
-        if mask is not None and any(mask):
-            labels = [token if int(flag) else -100 for token, flag in zip(ids, mask, strict=False)]
-            ids, labels = ids[-max_seq_length:], labels[-max_seq_length:]
-            if any(label != -100 for label in labels):
-                return ids, labels
+    # Preferred path: use tokenizer-provided assistant masks only when the chat
+    # template explicitly supports generation spans. Qwen3's current template
+    # does not always expose {% generation %}, and requesting the mask in that
+    # case emits a warning and returns an unusable all-zero mask.
+    chat_template = str(getattr(tokenizer, "chat_template", "") or "")
+    if "{% generation" in chat_template:
+        with contextlib.suppress(Exception):
+            encoded = apply_template(
+                tokenizer,
+                messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                return_dict=True,
+                return_assistant_tokens_mask=True,
+            )
+            ids = list(encoded["input_ids"])
+            mask = encoded.get("assistant_masks") or encoded.get("assistant_tokens_mask")
+            if mask is not None and any(mask):
+                labels = [token if int(flag) else -100 for token, flag in zip(ids, mask, strict=False)]
+                ids, labels = ids[-max_seq_length:], labels[-max_seq_length:]
+                if any(label != -100 for label in labels):
+                    return ids, labels
 
     # Compatibility fallback for templates without {% generation %} assistant masks.
     previous: list[int] = []

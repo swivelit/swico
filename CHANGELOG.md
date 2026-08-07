@@ -1,3 +1,8 @@
+
+## 2026-08-07 - Qwen smoke tokenization fix
+
+- Increased the Qwen smoke profile sequence length from 256 to 512 tokens so multilingual conversations do not lose assistant supervision during truncation.
+- Avoid requesting tokenizer assistant masks when the active Qwen chat template does not expose generation spans, removing the misleading Transformers warning and using the compatibility fallback directly.
 # Changelog
 
 ## 4.0.0 — timestamped experiments and adaptive resource protection
