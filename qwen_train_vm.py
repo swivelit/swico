@@ -661,59 +661,79 @@ def apply_template(tokenizer, messages: list[dict[str, str]], *, tokenize: bool,
 
 
 def assistant_only_tokens(tokenizer, messages: list[dict[str, str]], max_seq_length: int) -> tuple[list[int], list[int]]:
-    # Preferred path: use tokenizer-provided assistant masks only when the chat
-    # template explicitly supports generation spans. Qwen3's current template
-    # does not always expose {% generation %}, and requesting the mask in that
-    # case emits a warning and returns an unusable all-zero mask.
-    chat_template = str(getattr(tokenizer, "chat_template", "") or "")
-    if "{% generation" in chat_template:
-        with contextlib.suppress(Exception):
-            encoded = apply_template(
-                tokenizer,
-                messages,
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=True,
-                return_assistant_tokens_mask=True,
-            )
-            ids = list(encoded["input_ids"])
-            mask = encoded.get("assistant_masks") or encoded.get("assistant_tokens_mask")
-            if mask is not None and any(mask):
-                labels = [token if int(flag) else -100 for token, flag in zip(ids, mask, strict=False)]
-                ids, labels = ids[-max_seq_length:], labels[-max_seq_length:]
-                if any(label != -100 for label in labels):
-                    return ids, labels
+    """Tokenize a conversation and train only on assistant content tokens.
 
-    # Compatibility fallback for templates without {% generation %} assistant masks.
-    previous: list[int] = []
-    full_ids: list[int] = []
-    full_labels: list[int] = []
+    Qwen3's distributed chat template does not expose Transformers'
+    ``{% generation %}`` spans, so ``return_assistant_tokens_mask=True`` is
+    not reliable.  Instead we render the exact chat text once, derive the
+    character ranges occupied by assistant message content, and map those
+    ranges to token offsets from the fast tokenizer.  This avoids false
+    "conversation truncated" failures caused by template boundary rewrites.
+    """
+    rendered = str(
+        apply_template(
+            tokenizer,
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    )
+
+    assistant_spans: list[tuple[int, int]] = []
     for index, message in enumerate(messages):
-        current = list(
+        if message["role"] != "assistant":
+            continue
+
+        # Rendering the preceding turns with add_generation_prompt=True gives
+        # the exact text immediately before this assistant's response.
+        prefix = str(
             apply_template(
                 tokenizer,
-                messages[: index + 1],
-                tokenize=True,
-                add_generation_prompt=False,
+                messages[:index],
+                tokenize=False,
+                add_generation_prompt=True,
             )
         )
-        prefix = common_prefix_length(previous, current)
-        if prefix < len(previous):
-            # Rare template rewrite: preserve already-labelled common prefix and re-mask rewrite tail.
-            full_ids = current[:prefix]
-            full_labels = full_labels[:prefix]
-        suffix = current[prefix:]
-        full_ids = current
-        full_labels = full_labels[:prefix] + (
-            suffix if message["role"] == "assistant" else [-100] * len(suffix)
-        )
-        previous = current
+        content = str(message["content"])
+        start = len(prefix)
 
-    full_ids = full_ids[-max_seq_length:]
-    full_labels = full_labels[-max_seq_length:]
-    if not any(label != -100 for label in full_labels):
-        raise ValueError("A conversation was truncated before all assistant response tokens; increase SWICO_QWEN_MAX_SEQ_LENGTH")
-    return full_ids, full_labels
+        # Normal Qwen3 path: assistant content follows the generation prompt
+        # verbatim.  Keep a guarded search fallback for compatible templates
+        # that insert harmless whitespace around the response.
+        if not rendered.startswith(content, start):
+            located = rendered.find(content, max(0, start - 16))
+            if located < 0:
+                raise ValueError(
+                    f"Could not locate assistant response {index} in rendered Qwen chat template"
+                )
+            start = located
+        assistant_spans.append((start, start + len(content)))
+
+    encoded = tokenizer(
+        rendered,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+        truncation=False,
+    )
+    ids = list(encoded["input_ids"])
+    offsets = list(encoded["offset_mapping"])
+    labels: list[int] = []
+    for token_id, offset in zip(ids, offsets, strict=False):
+        token_start, token_end = int(offset[0]), int(offset[1])
+        is_assistant = token_end > token_start and any(
+            token_start < span_end and token_end > span_start
+            for span_start, span_end in assistant_spans
+        )
+        labels.append(int(token_id) if is_assistant else -100)
+
+    ids = ids[-max_seq_length:]
+    labels = labels[-max_seq_length:]
+    if not any(label != -100 for label in labels):
+        raise ValueError(
+            "A conversation has no assistant response tokens after tokenization/truncation; "
+            "verify the chat template or increase SWICO_QWEN_MAX_SEQ_LENGTH"
+        )
+    return ids, labels
 
 
 def tokenize_split(tokenizer, rows: list[dict[str, Any]], max_seq_length: int) -> Dataset:

@@ -55,3 +55,11 @@ Qwen:
 training_artifacts/qwen3-0.6b-swico/latest/models/adapter/
 training_artifacts/qwen3-0.6b-swico/latest/reports/final_report.md
 ```
+
+## 2026-08-07 Qwen3 assistant-label regression fix
+
+- Replaced `return_assistant_tokens_mask=True` usage with tokenizer offset-based assistant-content labeling.
+- Prevents false `A conversation was truncated before all assistant response tokens` errors caused by Qwen3 chat-template boundary rewrites.
+- Keeps assistant-only SFT: system/user/template tokens remain masked with `-100`.
+- Qwen smoke profile remains at a 512-token maximum sequence length.
+- Full source-contract/config test suite: 16 tests passing.
