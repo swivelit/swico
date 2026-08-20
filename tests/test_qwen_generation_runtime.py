@@ -11,7 +11,14 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "qwen_train_vm.py").read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
-WANTED = {"apply_template", "generate_samples"}
+WANTED = {
+    "apply_template",
+    "generate_samples",
+    "qwen_language_bucket",
+    "stratified_generation_rows",
+    "summarize_generation_samples",
+    "stable_hash",
+}
 NODES = [node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name in WANTED]
 MODULE = ast.Module(body=NODES, type_ignores=[])
 ast.fix_missing_locations(MODULE)
@@ -84,6 +91,36 @@ class QwenGenerationRuntimeTests(unittest.TestCase):
         self.assertEqual(len(samples), 1)
         self.assertEqual(samples[0]["generated"], "generated answer")
         self.assertEqual(samples[0]["expected"], "Hi")
+        self.assertEqual(samples[0]["output_token_count"], 1)
+        self.assertFalse(samples[0]["eos_or_end_of_message_produced"])
+        self.assertFalse(samples[0]["max_token_hit"])
+        self.assertIn("repeated_4gram_ratio", samples[0])
+
+    def test_generation_selection_is_language_stratified_and_summary_flags_unhealthy(self) -> None:
+        rows = [
+            {"conversation_id": f"{language}-{index}", "language": language}
+            for language in ("en", "ta", "tanglish", "ta-en")
+            for index in range(3)
+        ]
+        selected = NS["stratified_generation_rows"](rows, 8, 42)
+        buckets = [NS["qwen_language_bucket"](row) for row in selected]
+        self.assertEqual({"english", "tamil", "tanglish", "tamil-english-mixed"}, set(buckets))
+        summary = NS["summarize_generation_samples"](
+            [
+                {
+                    "language": "english",
+                    "eos_or_end_of_message_produced": False,
+                    "max_new_tokens_reached": True,
+                    "max_token_hit": True,
+                    "output_token_count": 128,
+                    "generation_time_seconds": 2.0,
+                    "tokens_per_second": 64.0,
+                    "repeated_4gram_ratio": 0.5,
+                }
+            ]
+        )
+        self.assertFalse(summary["health"]["healthy"])
+        self.assertIn("termination rate below 95%", summary["health"]["unhealthy_reasons"])
 
 
 if __name__ == "__main__":

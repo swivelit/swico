@@ -1,4 +1,4 @@
-# Qwen CPU LoRA runtime fixes
+# Qwen CPU LoRA runtime and termination fixes
 
 This build includes the earlier multi-turn assistant-labeling fix and adds the runtime fix for the latest smoke-training failure:
 
@@ -20,13 +20,16 @@ The Qwen smoke run completed tokenization and LoRA training successfully, then f
 - enables KV cache for inference-only generation;
 - removes `EarlyStoppingCallback` after training and before held-out test evaluation, preventing the misleading `eval_loss` warning caused by the `test_` metric prefix.
 
-## Existing assistant-labeling fix retained
+## Assistant termination supervision
 
-The trainer still uses temporary assistant-boundary markers to derive exact assistant-only labels for multi-turn Qwen conversations. Those markers are removed before tokenization and are never trained on.
+The trainer first uses the active Qwen tokenizer's native assistant generation mask. It labels assistant content and the tokenizer-defined Qwen EOS/end-of-message token after every assistant span, while system/user text, role headers and disabled-thinking wrapper text remain masked. Older Transformers templates use the marker/offset compatibility path; markers are removed before tokenization and are never trained on.
+
+This prevents the common failure where a good answer is followed by unconstrained generation until `max_new_tokens` because the model was never trained to emit its own turn terminator.
 
 ## Validation
 
-- Full unit-test suite: 20 passed.
+- Full unit-test suite: run on the target VM after installing `requirements-cpu.txt`.
 - Runtime regression test verifies a BatchEncoding-like object is unpacked to tensors before `model.generate()`.
-- Multi-turn assistant-labeling regression test remains green.
+- Multi-turn assistant content/end-of-message, system/user masking, thinking-wrapper masking and truncation regressions are covered.
+- VM generation evaluation now uses 30 deterministic language-stratified samples with termination and max-token health thresholds.
 - Python compilation check passed.

@@ -47,6 +47,8 @@ Static validation also covers:
 - resumable timestamped Qwen runs
 - memory guard callback
 - adapter and final-report export paths
+- native Qwen assistant-mask and end-of-message supervision, including truncation protection
+- stratified 30-sample generation metrics and unhealthy-candidate reporting
 
 Target-VM validation:
 

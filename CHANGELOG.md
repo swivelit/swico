@@ -3,6 +3,15 @@
 
 - Increased the Qwen smoke profile sequence length from 256 to 512 tokens so multilingual conversations do not lose assistant supervision during truncation.
 - Avoid requesting tokenizer assistant masks when the active Qwen chat template does not expose generation spans, removing the misleading Transformers warning and using the compatibility fallback directly.
+
+## 2026-08-20 - Qwen termination supervision and evaluation controls
+
+- Label Qwen assistant content and the tokenizer-defined end-of-message/EOS token for every assistant turn, while continuing to mask roles, system/user text and thinking wrappers.
+- Added regression coverage for multi-turn termination labels and truncation that would otherwise produce prompt-only examples.
+- Changed VM Qwen defaults to 5e-5 learning rate, 2 maximum epochs, 250-step evaluation/saving and early-stopping patience 3.
+- Increased VM held-out generation evaluation to 30 deterministic, language-stratified samples with termination, max-token, latency, throughput and repetition metrics.
+- Added effective training configuration, dataset/cap provenance, per-language summaries and unhealthy-candidate warnings to final reports.
+- Documented adapter-only and optional merged export; merged-model speed must be benchmarked rather than assumed.
 # Changelog
 
 ## 4.0.0 — timestamped experiments and adaptive resource protection

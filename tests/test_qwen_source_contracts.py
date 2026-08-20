@@ -17,6 +17,9 @@ class QwenSourceContractTests(unittest.TestCase):
         self.assertIn("assistant_only_tokens", SOURCE)
         self.assertIn("SWICO_QWEN_ASSISTANT_BOUNDARY", SOURCE)
         self.assertIn("enable_thinking=False", SOURCE)
+        self.assertIn("return_assistant_tokens_mask=True", SOURCE)
+        self.assertIn("termination_ids", SOURCE)
+        self.assertIn("no assistant content or termination tokens after tokenization/truncation", SOURCE)
 
     def test_conversation_level_split_and_leakage_check_are_wired(self) -> None:
         self.assertIn("split_conversations", SOURCE)
@@ -42,6 +45,14 @@ class QwenSourceContractTests(unittest.TestCase):
         self.assertIn('"input_ids" in rendered', SOURCE)
         self.assertIn('torch.ones_like(input_ids)', SOURCE)
         self.assertIn('use_cache=True', SOURCE)
+
+    def test_step_evaluation_and_stratified_generation_reporting_are_wired(self) -> None:
+        self.assertIn('"save_strategy": "steps"', SOURCE)
+        self.assertIn('"eval_strategy": "steps"', SOURCE)
+        self.assertIn("stratified_generation_rows", SOURCE)
+        self.assertIn("summarize_generation_samples", SOURCE)
+        self.assertIn('"max_token_hit_rate"', SOURCE)
+        self.assertIn('"unhealthy_reasons"', SOURCE)
 
     def test_early_stopping_callback_is_removed_before_test_evaluation(self) -> None:
         self.assertIn('trainer.remove_callback(EarlyStoppingCallback)', SOURCE)

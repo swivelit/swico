@@ -101,12 +101,14 @@ class Profile:
     gradient_accumulation_steps: int
     max_seq_length: int
     eval_generation_samples: int
+    eval_steps: int
+    save_steps: int
 
 
 PROFILES: dict[str, Profile] = {
-    "smoke": Profile("smoke", 64, 1.0, 1, 4, 512, 1),
-    "vm": Profile("vm", 12_000, 3.0, 1, 16, 512, 3),
-    "full": Profile("full", None, 3.0, 1, 16, 768, 5),
+    "smoke": Profile("smoke", 64, 1.0, 1, 4, 512, 1, 1, 1),
+    "vm": Profile("vm", 12_000, 2.0, 1, 16, 512, 30, 250, 250),
+    "full": Profile("full", None, 3.0, 1, 16, 768, 30, 250, 250),
 }
 
 
@@ -257,7 +259,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=env_optional_int("SWICO_QWEN_BATCH_SIZE"))
     parser.add_argument("--eval-batch-size", type=int, default=env_int("SWICO_QWEN_EVAL_BATCH_SIZE", 1))
     parser.add_argument("--gradient-accumulation-steps", type=int, default=env_optional_int("SWICO_QWEN_GRADIENT_ACCUMULATION_STEPS"))
-    parser.add_argument("--learning-rate", type=float, default=env_float("SWICO_QWEN_LEARNING_RATE", 1.0e-4))
+    parser.add_argument("--learning-rate", type=float, default=env_float("SWICO_QWEN_LEARNING_RATE", 5.0e-5))
     parser.add_argument("--weight-decay", type=float, default=env_float("SWICO_QWEN_WEIGHT_DECAY", 0.01))
     parser.add_argument("--warmup-ratio", type=float, default=env_float("SWICO_QWEN_WARMUP_RATIO", 0.05))
     parser.add_argument("--lr-scheduler-type", default=env_text("SWICO_QWEN_LR_SCHEDULER_TYPE", "cosine"))
@@ -265,6 +267,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_GRADIENT_CHECKPOINTING", True))
     parser.add_argument("--logging-steps", type=int, default=env_int("SWICO_QWEN_LOGGING_STEPS", 5))
     parser.add_argument("--save-total-limit", type=int, default=env_int("SWICO_QWEN_SAVE_TOTAL_LIMIT", 2))
+    parser.add_argument("--eval-steps", type=int, default=env_optional_int("SWICO_QWEN_EVAL_STEPS"))
+    parser.add_argument("--save-steps", type=int, default=env_optional_int("SWICO_QWEN_SAVE_STEPS"))
     parser.add_argument("--dataloader-num-workers", type=int, default=env_int("SWICO_QWEN_DATALOADER_NUM_WORKERS", 0))
 
     parser.add_argument("--lora-r", type=int, default=env_int("SWICO_QWEN_LORA_R", 8))
@@ -277,7 +281,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument("--early-stopping", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_EARLY_STOPPING", True))
-    parser.add_argument("--early-stopping-patience", type=int, default=env_int("SWICO_QWEN_EARLY_STOPPING_PATIENCE", 2))
+    parser.add_argument("--early-stopping-patience", type=int, default=env_int("SWICO_QWEN_EARLY_STOPPING_PATIENCE", 3))
     parser.add_argument("--early-stopping-threshold", type=float, default=env_float("SWICO_QWEN_EARLY_STOPPING_THRESHOLD", 0.001))
     parser.add_argument("--load-best-model-at-end", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_LOAD_BEST_MODEL_AT_END", True))
     parser.add_argument("--merge-adapter", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_MERGE_ADAPTER", False))
@@ -312,6 +316,8 @@ def resolve_profile(args: argparse.Namespace) -> Profile:
             if args.eval_generation_samples is not None
             else base.eval_generation_samples
         ),
+        eval_steps=args.eval_steps if args.eval_steps is not None else base.eval_steps,
+        save_steps=args.save_steps if args.save_steps is not None else base.save_steps,
     )
 
 
@@ -322,10 +328,16 @@ def validate_config(args: argparse.Namespace, profile: Profile) -> None:
         raise ConfigError("epochs and batch sizes must be positive")
     if profile.gradient_accumulation_steps <= 0:
         raise ConfigError("gradient accumulation steps must be positive")
+    if profile.eval_steps <= 0 or profile.save_steps <= 0:
+        raise ConfigError("evaluation and save steps must be positive")
+    if args.load_best_model_at_end and profile.save_steps % profile.eval_steps:
+        raise ConfigError("save steps must be a multiple of eval steps when loading the best model")
     if profile.max_seq_length < 64:
         raise ConfigError("max sequence length must be at least 64")
     if args.learning_rate <= 0 or args.max_grad_norm <= 0:
         raise ConfigError("learning rate and max grad norm must be positive")
+    if args.generation_max_new_tokens <= 0:
+        raise ConfigError("generation max new tokens must be positive")
     if not 0 <= args.lora_dropout < 1:
         raise ConfigError("LoRA dropout must be in [0, 1)")
     if args.lora_r <= 0 or args.lora_alpha <= 0:
@@ -340,6 +352,7 @@ def validate_config(args: argparse.Namespace, profile: Profile) -> None:
 
 
 def qwen_effective_config(args: argparse.Namespace, profile: Profile) -> dict[str, Any]:
+    profile_default = PROFILES[args.profile]
     return {
         "script_version": SCRIPT_VERSION,
         "profile": dataclasses.asdict(profile),
@@ -354,7 +367,19 @@ def qwen_effective_config(args: argparse.Namespace, profile: Profile) -> dict[st
         "bf16": args.bf16,
         "offline": args.offline,
         "splits": [args.train_split_fraction, args.validation_split_fraction, args.test_split_fraction],
+        "max_conversations": {
+            "requested_override": args.max_conversations,
+            "profile_default": profile_default.max_conversations,
+            "effective": profile.max_conversations,
+            "source": "explicit override" if args.max_conversations is not None else "profile default",
+        },
+        "max_seq_length": profile.max_seq_length,
+        "epochs": profile.epochs,
+        "batch_size": profile.batch_size,
+        "gradient_accumulation_steps": profile.gradient_accumulation_steps,
         "eval_batch_size": args.eval_batch_size,
+        "eval_steps": profile.eval_steps,
+        "save_steps": profile.save_steps,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "warmup_ratio": args.warmup_ratio,
@@ -631,6 +656,16 @@ def prepare_dataset(
         "source_sha256": file_sha256(data_path),
         "raw_message_rows": int(len(frame)),
         "unique_conversations_after_dedup": len(conversations),
+        "max_conversations_cap_requested": args.max_conversations,
+        "max_conversations_cap_profile_default": PROFILES[args.profile].max_conversations,
+        "max_conversations_cap_effective": profile.max_conversations,
+        "max_conversations_cap_source": (
+            "explicit override" if args.max_conversations is not None else "profile default"
+        ),
+        "selected_conversations_before_split": sum(len(values) for values in splits.values()),
+        "conversations_excluded_by_cap": max(
+            0, len(conversations) - sum(len(values) for values in splits.values())
+        ),
         "split_conversations": {name: len(values) for name, values in splits.items()},
         "conversation_id_overlap": overlaps,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -640,6 +675,12 @@ def prepare_dataset(
         "Prepared conversations: train=%d validation=%d test=%d",
         len(splits["train"]), len(splits["validation"]), len(splits["test"]),
     )
+    if profile.max_conversations is not None and len(conversations) > profile.max_conversations:
+        logger.info(
+            "Conversation cap is explicit: dataset has %d deduplicated conversations; profile selects %d",
+            len(conversations),
+            profile.max_conversations,
+        )
     return splits, meta
 
 
@@ -661,106 +702,155 @@ def apply_template(tokenizer, messages: list[dict[str, str]], *, tokenize: bool,
 
 
 def assistant_only_tokens(tokenizer, messages: list[dict[str, str]], max_seq_length: int) -> tuple[list[int], list[int]]:
-    """Tokenize a conversation and train only on assistant content tokens.
+    """Label assistant content plus the Qwen end-of-message token.
 
-    Qwen3's distributed chat template does not expose Transformers'
-    ``{% generation %}`` spans consistently.  We therefore inject temporary,
-    unique marker strings around assistant message content, render the chat
-    template exactly once, remove those markers, and convert their positions
-    into character spans.  The markers are never tokenized or trained on.
-
-    This is robust to Qwen adding role headers, thinking wrappers, whitespace,
-    or other template text around assistant replies, and it avoids fragile
-    raw-response searches in the rendered conversation.
+    Current Transformers/Qwen templates expose native assistant generation
+    spans.  Those spans preserve the active template's role headers and
+    thinking wrapper without duplicating its formatting here.  Qwen's
+    ``<|im_end|>`` is outside the generation span, so the tokenizer's EOS
+    token is added after every assistant span.  An offset-based marker
+    fallback is retained for older Transformers versions with no native mask;
+    it never searches for a raw response string.
     """
-    marker_nonce = "SWICO_QWEN_ASSISTANT_BOUNDARY_7F3A9C"
-    marked_messages: list[dict[str, str]] = []
-    assistant_count = 0
-    for message in messages:
-        cloned = dict(message)
-        content = str(message["content"])
-        if message["role"] == "assistant":
-            start_marker = f"<{marker_nonce}_START_{assistant_count}>"
-            end_marker = f"<{marker_nonce}_END_{assistant_count}>"
-            if start_marker in content or end_marker in content:
-                raise ValueError("Qwen assistant-boundary marker unexpectedly appears in training data")
-            cloned["content"] = f"{start_marker}{content}{end_marker}"
-            assistant_count += 1
-        marked_messages.append(cloned)
-
+    if max_seq_length <= 0:
+        raise ValueError("max_seq_length must be positive")
+    assistant_count = sum(1 for message in messages if message["role"] == "assistant")
     if assistant_count == 0:
         raise ValueError("A conversation contains no assistant messages")
 
-    marked_rendered = str(
-        apply_template(
+    def flatten(value) -> list[int]:
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        while isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], (list, tuple)):
+            value = value[0]
+        return [int(item) for item in value]
+
+    termination_ids: set[int] = set()
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(eos_id, (list, tuple, set)):
+        termination_ids.update(int(item) for item in eos_id if item is not None)
+    elif eos_id is not None:
+        termination_ids.add(int(eos_id))
+    def label_termination(ids: list[int], labels: list[int], mask: list[int]) -> None:
+        index = 0
+        while index < len(ids):
+            if not mask[index]:
+                index += 1
+                continue
+            end = index
+            while end + 1 < len(ids) and mask[end + 1]:
+                end += 1
+            lookahead = end + 1
+            while lookahead < len(ids) and lookahead <= end + 8 and not mask[lookahead]:
+                if ids[lookahead] in termination_ids:
+                    labels[lookahead] = ids[lookahead]
+                    break
+                lookahead += 1
+            index = end + 1
+
+    native_ids: list[int] | None = None
+    native_mask: list[int] | None = None
+    try:
+        native = apply_template(
             tokenizer,
-            marked_messages,
-            tokenize=False,
+            messages,
+            tokenize=True,
             add_generation_prompt=False,
+            return_dict=True,
+            return_assistant_tokens_mask=True,
         )
-    )
+        if hasattr(native, "keys") and "input_ids" in native:
+            candidate_mask = native.get("assistant_masks")
+            if candidate_mask is None:
+                candidate_mask = native.get("assistant_tokens_mask")
+            if candidate_mask is not None:
+                candidate_mask_values = flatten(candidate_mask)
+                if any(candidate_mask_values):
+                    native_ids = flatten(native["input_ids"])
+                    native_mask = candidate_mask_values
+        elif isinstance(native, dict) and "input_ids" in native:
+            candidate_mask = native.get("assistant_masks")
+            if candidate_mask is None:
+                candidate_mask = native.get("assistant_tokens_mask")
+            if candidate_mask is not None:
+                candidate_mask_values = flatten(candidate_mask)
+                if any(candidate_mask_values):
+                    native_ids = flatten(native["input_ids"])
+                    native_mask = candidate_mask_values
+    except (TypeError, ValueError, KeyError, AssertionError):
+        native_ids = None
+        native_mask = None
 
-    clean_parts: list[str] = []
-    assistant_spans: list[tuple[int, int]] = []
-    source_pos = 0
-    clean_pos = 0
-    for assistant_index in range(assistant_count):
-        start_marker = f"<{marker_nonce}_START_{assistant_index}>"
-        end_marker = f"<{marker_nonce}_END_{assistant_index}>"
-        start_at = marked_rendered.find(start_marker, source_pos)
-        if start_at < 0:
-            raise ValueError(
-                f"Qwen chat template did not preserve assistant start marker {assistant_index}"
+    if native_ids is not None and native_mask is not None:
+        if len(native_ids) != len(native_mask):
+            raise ValueError("Qwen tokenizer returned mismatched input_ids and assistant mask lengths")
+        labels = [token_id if mask else -100 for token_id, mask in zip(native_ids, native_mask, strict=True)]
+        label_termination(native_ids, labels, native_mask)
+        ids = native_ids
+    else:
+        marker_nonce = "SWICO_QWEN_ASSISTANT_BOUNDARY_7F3A9C"
+        marked_messages: list[dict[str, str]] = []
+        assistant_index = 0
+        for message in messages:
+            cloned = dict(message)
+            if message["role"] == "assistant":
+                start_marker = f"<{marker_nonce}_START_{assistant_index}>"
+                end_marker = f"<{marker_nonce}_END_{assistant_index}>"
+                content = str(message["content"])
+                if start_marker in content or end_marker in content:
+                    raise ValueError("Qwen assistant-boundary marker unexpectedly appears in training data")
+                cloned["content"] = f"{start_marker}{content}{end_marker}"
+                assistant_index += 1
+            marked_messages.append(cloned)
+        marked_rendered = str(apply_template(tokenizer, marked_messages, tokenize=False, add_generation_prompt=False))
+
+        clean_parts: list[str] = []
+        assistant_spans: list[tuple[int, int]] = []
+        source_pos = 0
+        clean_pos = 0
+        for assistant_index in range(assistant_count):
+            start_marker = f"<{marker_nonce}_START_{assistant_index}>"
+            end_marker = f"<{marker_nonce}_END_{assistant_index}>"
+            start_at = marked_rendered.find(start_marker, source_pos)
+            if start_at < 0:
+                raise ValueError(f"Qwen chat template did not preserve assistant start marker {assistant_index}")
+            before = marked_rendered[source_pos:start_at]
+            clean_parts.append(before)
+            clean_pos += len(before)
+            content_start = start_at + len(start_marker)
+            end_at = marked_rendered.find(end_marker, content_start)
+            if end_at < 0:
+                raise ValueError(f"Qwen chat template did not preserve assistant end marker {assistant_index}")
+            assistant_text = marked_rendered[content_start:end_at]
+            span_start = clean_pos
+            clean_parts.append(assistant_text)
+            clean_pos += len(assistant_text)
+            assistant_spans.append((span_start, clean_pos))
+            source_pos = end_at + len(end_marker)
+        clean_parts.append(marked_rendered[source_pos:])
+        rendered = "".join(clean_parts)
+        encoded = tokenizer(rendered, add_special_tokens=False, return_offsets_mapping=True, truncation=False)
+        ids = [int(token_id) for token_id in encoded["input_ids"]]
+        offsets = list(encoded["offset_mapping"])
+        if len(ids) != len(offsets):
+            raise ValueError("Tokenizer returned mismatched input_ids and offset_mapping lengths")
+        fallback_mask: list[int] = []
+        labels = []
+        for token_id, offset in zip(ids, offsets, strict=True):
+            token_start, token_end = int(offset[0]), int(offset[1])
+            is_assistant = token_end > token_start and any(
+                token_start < span_end and token_end > span_start
+                for span_start, span_end in assistant_spans
             )
-        before = marked_rendered[source_pos:start_at]
-        clean_parts.append(before)
-        clean_pos += len(before)
+            fallback_mask.append(1 if is_assistant else 0)
+            labels.append(token_id if is_assistant else -100)
+        label_termination(ids, labels, fallback_mask)
 
-        content_start = start_at + len(start_marker)
-        end_at = marked_rendered.find(end_marker, content_start)
-        if end_at < 0:
-            raise ValueError(
-                f"Qwen chat template did not preserve assistant end marker {assistant_index}"
-            )
-        assistant_text = marked_rendered[content_start:end_at]
-        span_start = clean_pos
-        clean_parts.append(assistant_text)
-        clean_pos += len(assistant_text)
-        assistant_spans.append((span_start, clean_pos))
-        source_pos = end_at + len(end_marker)
-
-    tail = marked_rendered[source_pos:]
-    clean_parts.append(tail)
-    rendered = "".join(clean_parts)
-
-    encoded = tokenizer(
-        rendered,
-        add_special_tokens=False,
-        return_offsets_mapping=True,
-        truncation=False,
-    )
-    ids = [int(token_id) for token_id in encoded["input_ids"]]
-    offsets = list(encoded["offset_mapping"])
-    if len(ids) != len(offsets):
-        raise ValueError("Tokenizer returned mismatched input_ids and offset_mapping lengths")
-
-    labels: list[int] = []
-    for token_id, offset in zip(ids, offsets, strict=True):
-        token_start, token_end = int(offset[0]), int(offset[1])
-        is_assistant = token_end > token_start and any(
-            token_start < span_end and token_end > span_start
-            for span_start, span_end in assistant_spans
-        )
-        labels.append(token_id if is_assistant else -100)
-
-    # Keep the newest context when a conversation exceeds the configured
-    # sequence length.  This mirrors the previous behavior while preserving
-    # assistant-only labels for the retained suffix.
     ids = ids[-max_seq_length:]
     labels = labels[-max_seq_length:]
     if not any(label != -100 for label in labels):
         raise ValueError(
-            "A conversation has no assistant response tokens after tokenization/truncation; "
+            "A conversation has no assistant content or termination tokens after tokenization/truncation; "
             "increase SWICO_QWEN_MAX_SEQ_LENGTH"
         )
     return ids, labels
@@ -834,9 +924,11 @@ def make_training_args(
         "max_grad_norm": args.max_grad_norm,
         "logging_steps": args.logging_steps,
         "save_total_limit": args.save_total_limit,
-        "save_strategy": "epoch",
-        "eval_strategy": "epoch",
-        "evaluation_strategy": "epoch",
+        "save_strategy": "steps",
+        "save_steps": profile.save_steps,
+        "eval_strategy": "steps",
+        "evaluation_strategy": "steps",
+        "eval_steps": profile.eval_steps,
         "load_best_model_at_end": bool(args.load_best_model_at_end),
         "metric_for_best_model": "eval_loss",
         "greater_is_better": False,
@@ -871,6 +963,46 @@ def count_trainable_parameters(model) -> dict[str, int | float]:
     }
 
 
+def qwen_language_bucket(row: dict[str, Any]) -> str:
+    labels = {item.strip().lower() for item in str(row.get("language", "")).split(",") if item.strip()}
+    if "ta-en" in labels:
+        return "tamil-english-mixed"
+    if "tanglish" in labels:
+        return "tanglish"
+    if "ta" in labels:
+        return "tamil"
+    return "english"
+
+
+def stratified_generation_rows(
+    rows: list[dict[str, Any]], count: int, seed: int
+) -> list[dict[str, Any]]:
+    """Select deterministic held-out conversations across the four language buckets."""
+    if count <= 0 or not rows:
+        return []
+    buckets = ("english", "tamil", "tanglish", "tamil-english-mixed")
+    grouped = {bucket: [] for bucket in buckets}
+    for row in rows:
+        grouped[qwen_language_bucket(row)].append(row)
+    for bucket in buckets:
+        grouped[bucket].sort(key=lambda row: stable_hash(str(row["conversation_id"]), seed))
+
+    selected: list[dict[str, Any]] = []
+    base, remainder = divmod(min(count, len(rows)), len(buckets))
+    targets = {bucket: base + (index < remainder) for index, bucket in enumerate(buckets)}
+    for bucket in buckets:
+        selected.extend(grouped[bucket][: targets[bucket]])
+
+    # If a bucket is unavailable, fill its quota deterministically from the
+    # remaining test set rather than reducing the requested evaluation size.
+    selected_ids = {row["conversation_id"] for row in selected}
+    remaining = [row for row in rows if row["conversation_id"] not in selected_ids]
+    remaining.sort(key=lambda row: stable_hash(str(row["conversation_id"]), seed + 1))
+    selected.extend(remaining[: max(0, min(count, len(rows)) - len(selected))])
+    selected.sort(key=lambda row: stable_hash(str(row["conversation_id"]), seed + 2))
+    return selected[:count]
+
+
 def generate_samples(
     model,
     tokenizer,
@@ -883,6 +1015,22 @@ def generate_samples(
         return []
     model.eval()
     samples: list[dict[str, Any]] = []
+    def language_bucket(row: dict[str, Any]) -> str:
+        labels = {item.strip().lower() for item in str(row.get("language", "")).split(",") if item.strip()}
+        if "ta-en" in labels:
+            return "tamil-english-mixed"
+        if "tanglish" in labels:
+            return "tanglish"
+        if "ta" in labels:
+            return "tamil"
+        return "english"
+
+    termination_ids: set[int] = set()
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(eos_id, (list, tuple, set)):
+        termination_ids.update(int(item) for item in eos_id if item is not None)
+    elif eos_id is not None:
+        termination_ids.add(int(eos_id))
     for row in rows[:count]:
         messages = row["messages"]
         # Prompt on everything before the final assistant turn.
@@ -922,6 +1070,7 @@ def generate_samples(
         elif attention_mask.ndim == 1:
             attention_mask = attention_mask.unsqueeze(0)
 
+        started_at = __import__("time").perf_counter()
         with torch.inference_mode(), torch.autocast("cpu", dtype=torch.bfloat16, enabled=use_bf16):
             generated = model.generate(
                 input_ids=input_ids,
@@ -932,21 +1081,88 @@ def generate_samples(
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
+        generation_seconds = max(__import__("time").perf_counter() - started_at, 1e-9)
         completion = generated[0, input_ids.shape[-1] :]
+        completion_ids = [int(token_id) for token_id in completion.detach().cpu().tolist()]
+        produced_eos = any(token_id in termination_ids for token_id in completion_ids)
+        output_token_count = len(completion_ids)
+        four_grams = [tuple(completion_ids[index : index + 4]) for index in range(max(0, output_token_count - 3))]
+        repeated_four_gram_ratio = (
+            (len(four_grams) - len(set(four_grams))) / len(four_grams) if four_grams else 0.0
+        )
         text = tokenizer.decode(completion, skip_special_tokens=True).strip()
         samples.append(
             {
                 "conversation_id": row["conversation_id"],
+                "language": language_bucket(row),
                 "prompt_last_message": prompt_messages[-1]["content"] if prompt_messages else "",
                 "expected": expected,
                 "generated": text,
+                "output_token_count": output_token_count,
+                "eos_or_end_of_message_produced": produced_eos,
+                "max_new_tokens_reached": output_token_count >= max_new_tokens,
+                "max_token_hit": output_token_count >= max_new_tokens and not produced_eos,
+                "generation_time_seconds": generation_seconds,
+                "tokens_per_second": output_token_count / generation_seconds,
+                "repeated_4gram_ratio": repeated_four_gram_ratio,
             }
         )
     return samples
 
 
+def summarize_generation_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    def summarize(values: list[dict[str, Any]]) -> dict[str, Any]:
+        count = len(values)
+        if not count:
+            return {
+                "sample_count": 0,
+                "termination_rate": None,
+                "max_new_tokens_reached_rate": None,
+                "max_token_hit_rate": None,
+                "mean_output_token_count": None,
+                "mean_generation_time_seconds": None,
+                "mean_tokens_per_second": None,
+                "mean_repeated_4gram_ratio": None,
+            }
+        mean = lambda key: sum(float(item[key]) for item in values) / count
+        return {
+            "sample_count": count,
+            "termination_rate": sum(bool(item["eos_or_end_of_message_produced"]) for item in values) / count,
+            "max_new_tokens_reached_rate": sum(bool(item["max_new_tokens_reached"]) for item in values) / count,
+            "max_token_hit_rate": sum(bool(item["max_token_hit"]) for item in values) / count,
+            "mean_output_token_count": mean("output_token_count"),
+            "mean_generation_time_seconds": mean("generation_time_seconds"),
+            "mean_tokens_per_second": mean("tokens_per_second"),
+            "mean_repeated_4gram_ratio": mean("repeated_4gram_ratio"),
+        }
+
+    by_language = {
+        language: summarize([sample for sample in samples if sample.get("language") == language])
+        for language in ("english", "tamil", "tanglish", "tamil-english-mixed")
+    }
+    overall = summarize(samples)
+    unhealthy_reasons = []
+    if overall["termination_rate"] is not None and overall["termination_rate"] < 0.95:
+        unhealthy_reasons.append("termination rate below 95%")
+    if overall["max_token_hit_rate"] is not None and overall["max_token_hit_rate"] > 0.05:
+        unhealthy_reasons.append("max-token-hit rate above 5%")
+    return {
+        "overall": overall,
+        "by_language": by_language,
+        "health": {
+            "healthy": not unhealthy_reasons,
+            "unhealthy_reasons": unhealthy_reasons,
+        },
+    }
+
+
 def save_markdown_report(path: Path, report: dict[str, Any]) -> None:
     metrics = report.get("test_metrics", {})
+    generation = report.get("generation_evaluation", {})
+    generation_health = generation.get("health", {})
+    health_line = "HEALTHY"
+    if not generation_health.get("healthy", True):
+        health_line = "UNHEALTHY CANDIDATE: " + "; ".join(generation_health.get("unhealthy_reasons", []))
     lines = [
         "# Swico Qwen3-0.6B LoRA training report",
         "",
@@ -959,6 +1175,24 @@ def save_markdown_report(path: Path, report: dict[str, Any]) -> None:
         f"- Test loss: {metrics.get('eval_loss', metrics.get('test_loss', 'n/a'))}",
         f"- Test perplexity: {report.get('test_perplexity', 'n/a')}",
         f"- Adapter path: `{report.get('adapter_path')}`",
+        f"- Evaluated model: **{report.get('evaluated_model_status', 'unknown')}**",
+        f"- Generation health: **{health_line}**",
+        "",
+        "## Effective training configuration",
+        "",
+        f"- Dataset SHA-256: `{report.get('effective_training_config', {}).get('dataset_sha256')}`",
+        f"- Conversations: raw rows={report.get('dataset', {}).get('raw_message_rows')}, deduplicated={report.get('dataset', {}).get('unique_conversations_after_dedup')}, selected={report.get('dataset', {}).get('selected_conversations_before_split')}",
+        f"- Conversation cap: {report.get('effective_training_config', {}).get('max_conversations_cap_effective')} ({report.get('effective_training_config', {}).get('max_conversations_cap_source')})",
+        f"- Sequence length: {report.get('effective_training_config', {}).get('max_seq_length')}",
+        f"- Learning rate: {report.get('effective_training_config', {}).get('learning_rate')}",
+        f"- Epochs: requested={report.get('effective_training_config', {}).get('requested_epochs')}, actual={report.get('effective_training_config', {}).get('actual_epochs')}",
+        f"- Global steps: {report.get('effective_training_config', {}).get('global_steps')}",
+        f"- Batch: physical={report.get('effective_training_config', {}).get('batch_size')}, gradient accumulation={report.get('effective_training_config', {}).get('gradient_accumulation_steps')}",
+        f"- Best checkpoint: `{report.get('effective_training_config', {}).get('best_checkpoint')}`",
+        f"- Best validation loss: {report.get('effective_training_config', {}).get('best_validation_loss')}",
+        f"- BF16: supported={report.get('effective_training_config', {}).get('bf16_supported')}, enabled={report.get('effective_training_config', {}).get('bf16_enabled')}",
+        f"- LoRA: {report.get('effective_training_config', {}).get('lora')}",
+        f"- Export status: {report.get('effective_training_config', {}).get('merged_status')}",
         "",
         "## LoRA parameters",
         "",
@@ -967,7 +1201,14 @@ def save_markdown_report(path: Path, report: dict[str, Any]) -> None:
         "",
         "## Sample generations",
         "",
+        f"Overall generation summary: {generation.get('overall', {})}",
+        "",
+        "Per-language generation summary:",
+        "",
     ]
+    for language, summary in generation.get("by_language", {}).items():
+        lines.append(f"- {language}: {summary}")
+    lines.append("")
     for sample in report.get("generation_samples", []):
         lines.extend(
             [
@@ -977,6 +1218,7 @@ def save_markdown_report(path: Path, report: dict[str, Any]) -> None:
                 f"Expected: {sample['expected']}",
                 "",
                 f"Generated: {sample['generated']}",
+                f"Metrics: tokens={sample['output_token_count']}, terminated={sample['eos_or_end_of_message_produced']}, max-token-hit={sample['max_token_hit']}, time={sample['generation_time_seconds']:.3f}s, tokens/sec={sample['tokens_per_second']:.2f}, repeated-4gram-ratio={sample['repeated_4gram_ratio']:.3f}",
                 "",
             ]
         )
@@ -997,6 +1239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise FileNotFoundError(f"Dataset not found: {data_path}")
     data_hash = file_sha256(data_path)
     fingerprint = training_fingerprint(config, data_hash=data_hash)
+    config["dataset_sha256"] = data_hash
     output, resumed = allocate_run(args, profile, fingerprint)
     logger = setup_logger(output)
     if args.create_latest_links:
@@ -1094,13 +1337,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     test_metrics = trainer.evaluate(tokenized["test"], metric_key_prefix="test")
     test_loss = float(test_metrics.get("test_loss", test_metrics.get("eval_loss", float("nan"))))
     perplexity = math.exp(min(test_loss, 20.0)) if math.isfinite(test_loss) else None
+    generation_rows = stratified_generation_rows(splits["test"], profile.eval_generation_samples, args.seed)
     generation_samples = generate_samples(
         trainer.model,
         tokenizer,
-        splits["test"],
-        profile.eval_generation_samples,
+        generation_rows,
+        len(generation_rows),
         args.generation_max_new_tokens,
         use_bf16,
+    )
+    generation_evaluation = summarize_generation_samples(generation_samples)
+    logger.info(
+        "Held-out generation: %d samples, termination=%.1f%%, max-token-hit=%.1f%%",
+        len(generation_samples),
+        100.0 * (generation_evaluation["overall"]["termination_rate"] or 0.0),
+        100.0 * (generation_evaluation["overall"]["max_token_hit_rate"] or 0.0),
     )
 
     merged_path: str | None = None
@@ -1125,7 +1376,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         "test_perplexity": perplexity,
         "adapter_path": str(adapter_dir),
         "merged_model_path": merged_path,
+        "evaluated_model_status": "adapter-based",
         "generation_samples": generation_samples,
+        "generation_evaluation": generation_evaluation,
+        "effective_training_config": {
+            "dataset_sha256": data_hash,
+            "conversation_counts": dataset_meta["split_conversations"],
+            "raw_message_rows": dataset_meta["raw_message_rows"],
+            "unique_conversations_after_dedup": dataset_meta["unique_conversations_after_dedup"],
+            "selected_conversations": dataset_meta["selected_conversations_before_split"],
+            "max_conversations_cap_requested": dataset_meta["max_conversations_cap_requested"],
+            "max_conversations_cap_effective": dataset_meta["max_conversations_cap_effective"],
+            "max_conversations_cap_source": dataset_meta["max_conversations_cap_source"],
+            "max_seq_length": profile.max_seq_length,
+            "learning_rate": args.learning_rate,
+            "requested_epochs": profile.epochs,
+            "actual_epochs": trainer.state.epoch,
+            "global_steps": trainer.state.global_step,
+            "batch_size": profile.batch_size,
+            "gradient_accumulation_steps": profile.gradient_accumulation_steps,
+            "eval_steps": profile.eval_steps,
+            "save_steps": profile.save_steps,
+            "lora": {
+                "r": args.lora_r,
+                "alpha": args.lora_alpha,
+                "dropout": args.lora_dropout,
+                "target_modules": list(args.lora_target_modules),
+            },
+            "best_checkpoint": trainer.state.best_model_checkpoint,
+            "best_validation_loss": trainer.state.best_metric,
+            "bf16_supported": system["cpu_bf16_supported"],
+            "bf16_enabled": system["bf16_enabled"],
+            "merged_status": "merged export created" if merged_path else "adapter-only export; merged export disabled",
+        },
     }
     reports_dir = output / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)

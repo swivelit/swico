@@ -315,7 +315,8 @@ The Qwen trainer uses:
 - LoRA / PEFT rather than full-weight fine-tuning
 - validation loss for early stopping and best-checkpoint restoration
 - held-out test loss and perplexity
-- deterministic held-out sample generations
+- 30 deterministic held-out generations on the VM profile, stratified across English, Tamil, Tanglish and Tamil-English mixed conversations
+- per-generation termination, max-token, latency, throughput and repeated-4-gram metrics
 - CPU BF16 when the machine supports it
 - gradient accumulation and optional gradient checkpointing
 - timestamped compatible resume
@@ -375,16 +376,23 @@ The default `vm` profile is intentionally conservative for an 8-logical-CPU / ~2
 
 ```text
 max conversations = 12000
-epoch cap = 3
+epoch cap = 2
 physical batch = 1
 gradient accumulation = 16
 max sequence length = 512
+learning rate = 5e-5
+evaluation/save = every 250 optimizer steps
+early-stopping patience = 3 validation evaluations
 LoRA rank = 8
 LoRA alpha = 16
 LoRA dropout = 0.05
 ```
 
-Early stopping can finish before the epoch cap.
+The bundled CSV currently contains 22,854 deduplicated conversations. The VM profile still selects at most 12,000; this is reported as `max_conversations_cap_effective` and `max_conversations_cap_source` in run metadata. Set `SWICO_QWEN_MAX_CONVERSATIONS=22854` explicitly if a run should use the full dataset; this changes the run fingerprint and creates a separate experiment.
+
+Evaluation and saving are step-based and configurable with `SWICO_QWEN_EVAL_STEPS` and `SWICO_QWEN_SAVE_STEPS`. With `load_best_model_at_end=true`, keep save steps a multiple of evaluation steps.
+
+Early stopping can finish before the epoch cap. A final report marks the candidate **UNHEALTHY** if overall termination is below 95% or max-token-hit rate is above 5%; per-language summaries are included as well.
 
 ## Qwen outputs
 
@@ -411,7 +419,15 @@ By default only the LoRA adapter is exported. This is the recommended CPU-VM beh
 SWICO_QWEN_MERGE_ADAPTER=true
 ```
 
-Merging temporarily consumes more RAM.
+For a fresh merged-model training/export run:
+
+```bash
+SWICO_QWEN_RUN_MODE=new SWICO_QWEN_MERGE_ADAPTER=true ./run_qwen_training.sh
+```
+
+The adapter is still exported. Merging temporarily consumes more RAM. The held-out report states whether the evaluated model was adapter-based or merged; the current trainer evaluates the adapter-based model before optional export. Do not assume a merged model is faster—benchmark both models on the target CPU.
+
+Each final report records the dataset SHA, effective conversation cap and counts, sequence length, learning rate, requested/actual epochs, global steps, batch/accumulation settings, LoRA settings, best checkpoint/loss, BF16 state, and merged/unmerged export status.
 
 ## Which trainer should I run?
 
@@ -425,6 +441,12 @@ Qwen conversational generator:
 
 ```bash
 ./run_qwen_training.sh
+```
+
+For a fresh VM-profile Qwen run with the checked-in defaults:
+
+```bash
+SWICO_QWEN_RUN_MODE=new SWICO_QWEN_PROFILE=vm ./run_qwen_training.sh
 ```
 
 You should train and evaluate them independently. At application runtime, E5 retrieves relevant context and the fine-tuned Qwen model uses that context to produce the conversational response.
