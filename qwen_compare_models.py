@@ -25,6 +25,7 @@ from qwen_train_vm import (
     LANGUAGE_BUCKETS,
     assistant_only_tokens,
     generate_samples,
+    resolve_prepared_language,
     stable_hash,
     stratified_generation_rows,
     summarize_generation_samples,
@@ -76,7 +77,7 @@ def teacher_forced_loss(
         losses = torch.nn.functional.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), shifted.reshape(-1), ignore_index=-100, reduction="none"
         ).reshape_as(shifted)
-        language = str(row.get("language", "en"))
+        language = resolve_prepared_language(row)
         totals[language]["loss_sum"] += float(losses[mask].sum())
         totals[language]["token_count"] += int(mask.sum())
     result = {}
@@ -242,7 +243,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sample-count", type=int, default=40)
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--max-seq-length", type=int, default=512)
+    parser.add_argument("--max-seq-length", type=int, default=768)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--offline", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--include-loss", action=argparse.BooleanOptionalAction, default=False)

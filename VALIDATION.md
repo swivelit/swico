@@ -68,9 +68,9 @@ Tokenization-only audit on the target VM:
 SWICO_QWEN_AUDIT_TOKENIZATION=true ./run_qwen_training.sh
 ```
 
-This loads the Qwen tokenizer but not the model and writes `prepared/data_quality.json` and `prepared/tokenization_audit.json`. It does not change the 512-token setting.
+This loads the Qwen tokenizer but not the model and writes `prepared/data_quality.json` and `prepared/tokenization_audit.json`. The checked-in V2 env audits 768; pass `--max-seq-length 512` to audit the previous V1-style setting.
 
-The checked-in VM environment keeps the conservative 12,000-conversation profile cap. To use all available prepared conversations while retaining the VM hyperparameters, run `SWICO_QWEN_PROFILE=vm SWICO_QWEN_MAX_CONVERSATIONS=all ./run_qwen_training.sh`.
+The checked-in env uses V2 sequence length 768 while retaining the VM profile's other values. It keeps the conservative 12,000-conversation cap unless overridden. To use all available prepared conversations, run `SWICO_QWEN_PROFILE=vm SWICO_QWEN_MAX_CONVERSATIONS=all ./run_qwen_training.sh`.
 
 After the smoke run:
 

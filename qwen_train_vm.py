@@ -227,6 +227,12 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def ids_manifest_sha256(ids: Iterable[str]) -> str:
+    """Fingerprint a canonical one-ID-per-line manifest (sorted, UTF-8, final newline)."""
+    payload = "".join(f"{value}\n" for value in sorted(set(str(item).strip() for item in ids) - {""}))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def atomic_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -246,6 +252,33 @@ def _path_from_env(name: str, default: str | None) -> Path | None:
     if value is None:
         return Path(default) if default is not None else None
     return Path(value)
+
+
+def read_frozen_eval_ids(path: Path | None) -> tuple[set[str], dict[str, Any]]:
+    """Read one conversation ID per line and reject duplicates deterministically."""
+    if path is None:
+        return set(), {"configured": False, "path": None, "requested_count": 0, "sha256": None}
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Frozen evaluation ID file does not exist: {path}")
+    raw_lines = path.read_text(encoding="utf-8").splitlines()
+    ids = [line.strip() for line in raw_lines if line.strip() and not line.lstrip().startswith("#")]
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for value in ids:
+        if value in seen:
+            duplicates.add(value)
+        seen.add(value)
+    duplicates = sorted(duplicates)
+    if duplicates:
+        raise ValueError(f"Frozen evaluation ID file contains duplicate IDs: {duplicates[:10]}")
+    if not ids:
+        raise ValueError(f"Frozen evaluation ID file is empty: {path}")
+    return set(ids), {
+        "configured": True,
+        "path": str(path),
+        "requested_count": len(ids),
+        "sha256": file_sha256(path),
+    }
 
 
 def _split_csv_text(value: str) -> tuple[str, ...]:
@@ -318,6 +351,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--offline", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_OFFLINE", False))
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_RESUME", True))
     parser.add_argument("--prepare-only", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_PREPARE_ONLY", False))
+    parser.add_argument("--frozen-eval-ids", type=Path, default=_path_from_env("SWICO_QWEN_FROZEN_EVAL_IDS", None))
 
     try:
         env_conversation_cap = parse_conversation_cap(os.environ.get("SWICO_QWEN_MAX_CONVERSATIONS"))
@@ -513,6 +547,10 @@ def qwen_effective_config(args: argparse.Namespace, profile: Profile) -> dict[st
             "system_prompt_normalization": "derive from coherent non-system language and replace system content deterministically",
         },
         "audit_tokenization": args.audit_tokenization,
+        "frozen_eval": {
+            "ids_path": str(args.frozen_eval_ids) if args.frozen_eval_ids else None,
+            "configured": args.frozen_eval_ids is not None,
+        },
         "memory_guard": args.memory_guard,
         "emergency_available_memory_gib": args.emergency_available_memory_gib,
         "max_process_rss_gib": args.max_process_rss_gib,
@@ -684,6 +722,25 @@ def canonical_language(value: Any) -> str:
             f"Unsupported Qwen language {value!r}; expected one of {', '.join(CANONICAL_LANGUAGES)}"
         )
     return canonical
+
+
+def resolve_prepared_language(row: dict[str, Any]) -> str:
+    """Resolve canonical or legacy prepared-row metadata to one language.
+
+    V1 rows used ``en,<meaningful-language>`` because the system row was
+    always labelled English.  The non-system language is authoritative.
+    """
+    raw = str(row.get("language", ""))
+    parts = [part.strip() for part in raw.split(",")]
+    if not raw.strip() or any(not part for part in parts):
+        raise ValueError(f"Prepared row {row.get('conversation_id', '<unknown>')} has malformed language metadata: {raw!r}")
+    languages = {canonical_language(part) for part in parts}
+    meaningful = languages - {"en"}
+    if len(meaningful) > 1:
+        raise ValueError(
+            f"Prepared row {row.get('conversation_id', '<unknown>')} has ambiguous language metadata: {raw!r}"
+        )
+    return next(iter(meaningful)) if meaningful else "en"
 
 
 def has_tamil_script(text: str) -> bool:
@@ -858,22 +915,54 @@ def split_conversations(
     seed: int,
     fractions: tuple[float, float, float],
     max_conversations: int | None,
+    frozen_eval_ids: set[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    ordered = sorted(conversations, key=lambda item: stable_hash(item["digest"], seed))
+    if any(value <= 0 for value in fractions) or not math.isclose(sum(fractions), 1.0, abs_tol=1e-9):
+        raise ValueError("train/validation/test fractions must be positive and sum to 1.0")
+    frozen_eval_ids = set(frozen_eval_ids or set())
+    by_id = {str(item["conversation_id"]): item for item in conversations}
+    missing_frozen = sorted(frozen_eval_ids - set(by_id))
+    if missing_frozen:
+        raise ValueError(f"Frozen evaluation IDs are not present in the prepared dataset: {missing_frozen[:10]}")
+    # Identity and content deduplication are deliberately separate.  Prompt
+    # normalization or answer edits therefore cannot alter this ordering.
+    ordered = sorted(conversations, key=lambda item: stable_hash(str(item["conversation_id"]), seed))
+    if max_conversations == ALL_CONVERSATIONS:
+        max_conversations = None
     if max_conversations is not None:
-        ordered = ordered[:max_conversations]
+        frozen_items = [by_id[conversation_id] for conversation_id in sorted(frozen_eval_ids)]
+        if len(frozen_items) > max_conversations:
+            raise ValueError(
+                f"Frozen evaluation set ({len(frozen_items)}) exceeds conversation cap ({max_conversations})"
+            )
+        non_frozen = [item for item in ordered if str(item["conversation_id"]) not in frozen_eval_ids]
+        ordered = frozen_items + non_frozen[: max_conversations - len(frozen_items)]
     n = len(ordered)
     if n < 3:
         raise ValueError("Profile cap leaves fewer than 3 conversations")
-    train_n = max(1, int(round(n * fractions[0])))
-    val_n = max(1, int(round(n * fractions[1])))
-    if train_n + val_n >= n:
-        train_n = max(1, n - 2)
-        val_n = 1
+    frozen = [item for item in ordered if str(item["conversation_id"]) in frozen_eval_ids]
+    non_frozen = [item for item in ordered if str(item["conversation_id"]) not in frozen_eval_ids]
+    if len(frozen) > n - 2:
+        raise ValueError("Frozen evaluation set must leave at least one train and one validation conversation")
+    test_n = max(1, int(round(n * fractions[2])), len(frozen))
+    test_n = min(test_n, n - 2)
+    available_for_train_validation = n - test_n
+    train_fraction_of_non_test = fractions[0] / (fractions[0] + fractions[1])
+    train_n = min(
+        available_for_train_validation - 1,
+        max(1, int(round(available_for_train_validation * train_fraction_of_non_test))),
+    )
+    val_n = available_for_train_validation - train_n
+    # Frozen IDs occupy the test quota.  The remaining test quota is filled
+    # deterministically from non-frozen IDs; no extra test rows are added.
+    non_frozen.sort(key=lambda item: stable_hash(str(item["conversation_id"]), seed + 1))
+    train = non_frozen[:train_n]
+    validation = non_frozen[train_n : train_n + val_n]
+    test_fill = non_frozen[train_n + val_n : train_n + val_n + max(0, test_n - len(frozen))]
     return {
-        "train": ordered[:train_n],
-        "validation": ordered[train_n : train_n + val_n],
-        "test": ordered[train_n + val_n :],
+        "train": train,
+        "validation": validation,
+        "test": frozen + test_fill,
     }
 
 
@@ -883,6 +972,8 @@ def prepare_dataset(
     profile: Profile,
     args: argparse.Namespace,
     logger: logging.Logger,
+    frozen_eval_ids: set[str] | None = None,
+    frozen_eval_meta: dict[str, Any] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     if not data_path.exists():
         raise FileNotFoundError(f"Qwen dataset does not exist: {data_path}")
@@ -892,14 +983,32 @@ def prepare_dataset(
         conversations_before_quality,
         threshold=args.data_quality_repetition_threshold,
     )
+    frozen_eval_ids = set(frozen_eval_ids or set())
+    current_ids = {str(item["conversation_id"]) for item in conversations}
+    frozen_found = sorted(frozen_eval_ids & current_ids)
+    frozen_missing = sorted(frozen_eval_ids - current_ids)
+    frozen_validation = {
+        **(frozen_eval_meta or {"configured": False, "path": None, "requested_count": 0, "sha256": None}),
+        "found_count": len(frozen_found),
+        "missing_count": len(frozen_missing),
+        "missing_ids": frozen_missing,
+        "found_ids_sha256": ids_manifest_sha256(frozen_found) if frozen_found else None,
+    }
+    prepared = output / "prepared"
+    prepared.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(prepared / "frozen_eval_validation.json", frozen_validation)
+    if frozen_missing:
+        raise ValueError(
+            f"Frozen evaluation IDs not found after quality preparation ({len(frozen_missing)}): "
+            f"{frozen_missing[:10]}. See {prepared / 'frozen_eval_validation.json'}"
+        )
     splits = split_conversations(
         conversations,
         seed=args.seed,
         fractions=(args.train_split_fraction, args.validation_split_fraction, args.test_split_fraction),
         max_conversations=profile.max_conversations,
+        frozen_eval_ids=set(frozen_found),
     )
-    prepared = output / "prepared"
-    prepared.mkdir(parents=True, exist_ok=True)
     atomic_write_json(prepared / "data_quality.json", quality_report)
     for split_name, values in splits.items():
         with (prepared / f"{split_name}.jsonl").open("w", encoding="utf-8") as handle:
@@ -944,6 +1053,16 @@ def prepare_dataset(
         ),
         "split_conversations": {name: len(values) for name, values in splits.items()},
         "conversation_id_overlap": overlaps,
+        "frozen_eval": {
+            **frozen_validation,
+            "forced_test_count": len(frozen_found),
+            "nominal_test_quota": max(1, int(round(len(conversations) * args.test_split_fraction))),
+            "test_quota": len(splits["test"]),
+            "non_frozen_test_fill_count": len(splits["test"]) - len(frozen_found),
+            "frozen_exceeds_nominal_test_quota": len(frozen_found) > max(1, int(round(len(conversations) * args.test_split_fraction))),
+            "train_contains_frozen_ids": bool(ids["train"] & set(frozen_found)),
+            "validation_contains_frozen_ids": bool(ids["validation"] & set(frozen_found)),
+        },
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     atomic_write_json(prepared / "metadata.json", meta)
@@ -1351,8 +1470,8 @@ def count_trainable_parameters(model) -> dict[str, int | float]:
 
 
 def qwen_language_bucket(row: dict[str, Any]) -> str:
-    language = str(row.get("language", "en")).split(",")[0].strip().lower()
-    if language in {"ta-en", "ta_en", "tamil-english-mixed"}:
+    language = resolve_prepared_language(row)
+    if language == "ta-en":
         return "tamil-english-mixed"
     if language == "tanglish":
         return "tanglish"
@@ -1621,6 +1740,7 @@ def save_markdown_report(path: Path, report: dict[str, Any]) -> None:
         f"- LoRA: {report.get('effective_training_config', {}).get('lora')}",
         f"- Export status: {report.get('effective_training_config', {}).get('merged_status')}",
         f"- Data-quality exclusions: conversations={report.get('data_quality', {}).get('excluded_conversations')}, assistant messages={report.get('data_quality', {}).get('excluded_assistant_messages')}",
+        f"- Frozen evaluation: {report.get('frozen_eval', {}).get('found_count', 0)} IDs forced to test; test quota={report.get('frozen_eval', {}).get('test_quota')}",
         f"- Tokenization audit: `{report.get('effective_training_config', {}).get('tokenization_audit_path')}`",
         "",
         "## LoRA parameters",
@@ -1667,6 +1787,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset not found: {data_path}")
     data_hash = file_sha256(data_path)
+    frozen_eval_ids, frozen_eval_meta = read_frozen_eval_ids(args.frozen_eval_ids)
+    config["frozen_eval"] = {
+        **config["frozen_eval"],
+        **frozen_eval_meta,
+    }
     fingerprint = training_fingerprint(config, data_hash=data_hash)
     config["dataset_sha256"] = data_hash
     output, resumed = allocate_run(args, profile, fingerprint)
@@ -1679,6 +1804,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "invocation_fingerprint": fingerprint,
         "data_sha256": data_hash,
+        "frozen_eval": frozen_eval_meta,
         "resumed": resumed,
         "output": str(output),
     }
@@ -1688,7 +1814,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     atomic_write_json(output / "system.json", system)
     use_bf16 = bool(system["bf16_enabled"])
 
-    splits, dataset_meta = prepare_dataset(data_path, output, profile, args, logger)
+    splits, dataset_meta = prepare_dataset(
+        data_path,
+        output,
+        profile,
+        args,
+        logger,
+        frozen_eval_ids=frozen_eval_ids,
+        frozen_eval_meta=frozen_eval_meta,
+    )
     config["dataset_preparation"] = dataset_meta
     atomic_write_json(output / "run_config.json", config)
     if args.prepare_only and not args.audit_tokenization:
@@ -1856,6 +1990,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "excluded_conversations": dataset_meta["data_quality_excluded_conversations"],
             "excluded_assistant_messages": dataset_meta["data_quality_excluded_assistant_messages"],
         },
+        "frozen_eval": dataset_meta["frozen_eval"],
         "candidate_status": {
             "training_completed": True,
             "generation_healthy": generation_evaluation["health"]["healthy"],
@@ -1905,6 +2040,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
             "data_quality": quality_config_from_args(args),
             "tokenization_audit_path": str(output / "prepared" / "tokenization_audit.json"),
+            "frozen_eval": dataset_meta["frozen_eval"],
         },
     }
     reports_dir = output / "reports"

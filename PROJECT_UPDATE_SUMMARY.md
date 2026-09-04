@@ -2,11 +2,15 @@
 
 The Qwen pipeline now evaluates generation with `max_new_tokens=256` by default: 4 deterministic language-stratified smoke samples and 40 VM samples. The former 128-token setting is retained only as historical context; 384 is not used as a default.
 
+Legacy V1 prepared rows such as `en,ta` are now resolved by their meaningful non-system language (`ta`), not by the first metadata item. A model-free audit utility can verify benchmark bucket counts and create canonical frozen-ID manifests.
+
+Split assignment now uses conversation IDs rather than mutable conversation-content digests. Prompt normalization and answer edits therefore do not move a conversation between partitions; frozen evaluation IDs can be forced into the test quota without expanding it unnecessarily.
+
 Preparation derives one canonical language from non-system rows, so the English system-row label cannot contaminate language categories. The ta-en system prompt is normalized to Tamil-script-plus-English semantics, Tanglish remains Latin-script Tamil, and script/style checks are recorded.
 
 Preparation audits assistant responses with a conservative word-level repeated-4gram threshold (`>0.30`), excludes only clearly pathological conversations, and writes `prepared/data_quality.json`. User and assistant answer text is never automatically rewritten.
 
-Qwen runs also write tokenizer pre/post length, truncation, and supervised-token retention statistics by language. This is available in tokenizer-only mode and deliberately leaves the training sequence length at 512 pending evidence.
+Qwen runs also write tokenizer pre/post length, truncation, and supervised-token retention statistics by language. This is available in tokenizer-only mode. The real audit decision is now an explicit V2 VM sequence length of 768; 1024 is not selected.
 
 Generation health now requires all four language buckets and checks termination, max-token hits, repetition, and script adherence per bucket. `status=completed` remains a technical training result; candidate promotion is separate and always requires manual quality review.
 

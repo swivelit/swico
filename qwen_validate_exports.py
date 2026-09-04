@@ -13,7 +13,7 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from qwen_train_vm import apply_template, generate_samples, stratified_generation_rows
+from qwen_train_vm import apply_template, generate_samples, qwen_language_bucket, stratified_generation_rows
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -64,7 +64,7 @@ def main() -> int:
         merged = merged_by_id.get(row["conversation_id"], {})
         result = {
             "conversation_id": row["conversation_id"],
-            "language": row.get("language"),
+            "language": qwen_language_bucket(row),
             "expected": item.get("expected", ""),
             "adapter_answer": item.get("generated", ""),
             "merged_answer": merged.get("generated", ""),

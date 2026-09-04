@@ -328,7 +328,7 @@ The Qwen trainer uses:
 - per-generation termination, max-token, latency, throughput and repeated-4-gram metrics
 - per-language termination, max-token, repetition, bucket-presence and script-adherence health gates
 - deterministic data-quality filtering for severe word-level repeated-4-gram responses
-- tokenization/truncation diagnostics without changing the 512-token training default
+- tokenization/truncation diagnostics; V2 uses an explicit 768-token VM override based on the audit
 - CPU BF16 when the machine supports it
 - gradient accumulation and optional gradient checkpointing
 - timestamped compatible resume
@@ -366,7 +366,7 @@ Run the tokenizer-only audit (loads the tokenizer, never the model and never tra
 SWICO_QWEN_AUDIT_TOKENIZATION=true ./run_qwen_training.sh
 ```
 
-The resulting `prepared/data_quality.json` reports excluded conversation IDs and reasons. The default severe threshold is a word-level repeated-4-gram ratio above `0.30`; only clearly pathological conversations are excluded. The tokenizer report includes pre/post lengths, p50/p90/p95/p99, truncation rate, and assistant supervised-token retention by split and language.
+The resulting `prepared/data_quality.json` reports excluded conversation IDs and reasons. The default severe threshold is a word-level repeated-4-gram ratio above `0.30`; only clearly pathological conversations are excluded. The tokenizer report includes pre/post lengths, p50/p90/p95/p99, truncation rate, and assistant supervised-token retention by split and language. The checked-in Qwen env selects V2 sequence length 768 explicitly; pass `--max-seq-length 512` only when reproducing the old V1-style VM setting.
 
 ## Qwen smoke test
 
@@ -399,7 +399,7 @@ max conversations = 12000 (profile default)
 epoch cap = 2
 physical batch = 1
 gradient accumulation = 16
-max sequence length = 512
+max sequence length = 768 (explicit V2 env override; profile baseline remains 512)
 learning rate = 5e-5
 evaluation/save = every 250 optimizer steps
 early-stopping patience = 3 validation evaluations
@@ -416,7 +416,9 @@ To reproduce an all-conversation run with the successful VM hyperparameters:
 SWICO_QWEN_RUN_MODE=new SWICO_QWEN_PROFILE=vm SWICO_QWEN_MAX_CONVERSATIONS=all ./run_qwen_training.sh
 ```
 
-This keeps 2 epochs, sequence length 512, physical batch 1, gradient accumulation 16, learning rate 5e-5, and the existing LoRA settings. It does not switch to the `full` profile.
+This keeps 2 epochs, sequence length 768, physical batch 1, gradient accumulation 16, learning rate 5e-5, and the existing LoRA settings. It does not switch to the `full` profile. Split membership is derived from conversation IDs, so system-prompt normalization does not cause content-driven train/test drift.
+
+To reserve a frozen evaluation ID manifest for test-only evaluation, set `SWICO_QWEN_FROZEN_EVAL_IDS=/path/to/ids.txt` or pass `--frozen-eval-ids`. The file is one conversation ID per line; duplicates and missing IDs fail preparation with a report. Found IDs occupy the configured test quota and the remainder is deterministically filled from non-frozen conversations. Frozen configuration, counts, and SHA-256 are recorded in metadata and final reports.
 
 Evaluation and saving are step-based and configurable with `SWICO_QWEN_EVAL_STEPS` and `SWICO_QWEN_SAVE_STEPS`. With `load_best_model_at_end=true`, keep save steps a multiple of evaluation steps.
 
@@ -469,6 +471,16 @@ Omit `--champion-adapter` when none exists. This loads models sequentially, uses
 
 The champion path can also be supplied as `SWICO_QWEN_CHAMPION_ADAPTER=/path/to/adapter`; CLI arguments take precedence in the normal shell workflow.
 
+The model-free benchmark utility supports legacy-language counts and V1/V2 test intersection:
+
+```bash
+python qwen_dataset_audit.py --language-counts /path/to/frozen-benchmark.jsonl
+python qwen_dataset_audit.py --v1-test /path/to/v1/prepared/test.jsonl --v2-test /path/to/v2/prepared/test.jsonl --output /path/to/frozen_eval_ids.txt
+python qwen_dataset_audit.py --extract-ids /path/to/prepared/test.jsonl --output /path/to/test_ids.txt
+```
+
+The intersection/extraction manifest is sorted, UTF-8, one ID per line with a final newline; the utility prints its count and SHA-256. It does not load Qwen.
+
 After a merged or GGUF export, use `qwen_validate_exports.py` with a small multilingual prepared-test sample. It compares adapter-based HF output with merged HF output and, when `--gguf` and `--llama-cli` are supplied, GGUF output. The report makes no parity claim automatically; inspect all answers and metrics.
 
 To also create a merged standalone Qwen model during a new training run (not required for ordinary adapter training):
@@ -485,7 +497,7 @@ SWICO_QWEN_RUN_MODE=new SWICO_QWEN_MERGE_ADAPTER=true ./run_qwen_training.sh
 
 The adapter is still exported. Merging temporarily consumes more RAM. The held-out report states whether the evaluated model was adapter-based or merged; the current trainer evaluates the adapter-based model before optional export. Do not assume a merged model is faster—benchmark both models on the target CPU.
 
-Each final report records the dataset SHA, effective conversation cap and provenance, language validation, ta-en normalization, data-quality exclusions, tokenization statistics, generation sample count, `max_new_tokens=256`, health thresholds, best checkpoint/loss, BF16 state, and merged/unmerged export status. Training `status=completed` is separate from candidate/promotion status; a candidate is never automatically promoted or used to overwrite an existing adapter.
+Each final report records the dataset SHA, effective conversation cap and provenance, frozen-evaluation configuration, language validation, ta-en normalization, data-quality exclusions, tokenization statistics, generation sample count, `max_new_tokens=256`, health thresholds, best checkpoint/loss, BF16 state, and merged/unmerged export status. Training `status=completed` is separate from candidate/promotion status; a candidate is never automatically promoted or used to overwrite an existing adapter.
 
 ## Which trainer should I run?
 

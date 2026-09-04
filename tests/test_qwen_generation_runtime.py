@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import re
 import unittest
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,9 @@ WANTED = {
     "apply_template",
     "generate_samples",
     "qwen_language_bucket",
+    "resolve_prepared_language",
+    "canonical_language",
+    "normalize_content",
     "stratified_generation_rows",
     "summarize_generation_samples",
     "stable_hash",
@@ -23,7 +27,13 @@ WANTED = {
 NODES = [node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name in WANTED]
 MODULE = ast.Module(body=NODES, type_ignores=[])
 ast.fix_missing_locations(MODULE)
-NS: dict[str, object] = {"torch": torch, "Any": Any, "hashlib": hashlib}
+NS: dict[str, object] = {
+    "torch": torch,
+    "Any": Any,
+    "hashlib": hashlib,
+    "re": re,
+    "CANONICAL_LANGUAGES": ("en", "ta", "tanglish", "ta-en"),
+}
 exec(compile(MODULE, str(ROOT / "qwen_train_vm.py"), "exec"), NS)
 generate_samples = NS["generate_samples"]
 
@@ -82,6 +92,7 @@ class QwenGenerationRuntimeTests(unittest.TestCase):
         rows = [
             {
                 "conversation_id": "conv-1",
+                "language": "en",
                 "messages": [
                     {"role": "user", "content": "Hello"},
                     {"role": "assistant", "content": "Hi"},

@@ -6,20 +6,22 @@ import hashlib
 import json
 import math
 import re
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "qwen_train_vm.py").read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 WANTED = {
-    "stable_hash", "parse_conversation_cap", "conversation_cap_source", "conversation_cap_request",
-    "normalize_content", "canonical_language", "has_tamil_script", "has_latin_letters", "validate_language_style",
+    "stable_hash", "file_sha256", "ids_manifest_sha256", "read_frozen_eval_ids", "parse_conversation_cap", "conversation_cap_source", "conversation_cap_request",
+    "normalize_content", "canonical_language", "resolve_prepared_language", "has_tamil_script", "has_latin_letters", "validate_language_style",
     "word_tokens", "repeated_4gram_ratio", "validate_and_group_conversations", "audit_conversation_quality",
     "qwen_language_bucket", "stratified_generation_rows", "summarize_generation_samples",
-    "apply_template", "assistant_only_tokens", "_tokenization_summary", "tokenize_split", "build_tokenization_audit", "training_fingerprint",
+    "split_conversations", "apply_template", "assistant_only_tokens", "_tokenization_summary", "tokenize_split", "build_tokenization_audit", "training_fingerprint",
 }
 NODES = [node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name in WANTED]
 MODULE = ast.Module(body=NODES, type_ignores=[])
@@ -92,6 +94,23 @@ class QwenHardeningTests(unittest.TestCase):
         self.assertEqual(sum(item["system_prompt_normalized_count"] for item in conversations), 4)
         self.assertEqual(qwen.canonical_language("tamil-english-mixed"), "ta-en")
         self.assertEqual(qwen.qwen_language_bucket({"language": "ta-en"}), "tamil-english-mixed")
+
+    def test_legacy_language_metadata_resolves_to_meaningful_non_system_language(self) -> None:
+        expected = {
+            "en": "english",
+            "en,ta": "tamil",
+            "en,tanglish": "tanglish",
+            "en,ta-en": "tamil-english-mixed",
+            "ta": "tamil",
+            "tanglish": "tanglish",
+            "ta-en": "tamil-english-mixed",
+        }
+        for metadata, bucket in expected.items():
+            self.assertEqual(qwen.qwen_language_bucket({"conversation_id": metadata, "language": metadata}), bucket)
+        with self.assertRaises(ValueError):
+            qwen.qwen_language_bucket({"conversation_id": "ambiguous", "language": "en,ta,tanglish"})
+        with self.assertRaises(ValueError):
+            qwen.qwen_language_bucket({"conversation_id": "malformed", "language": "en,"})
 
     def test_system_en_does_not_make_tamil_conversation_multilingual(self) -> None:
         frame = pd.DataFrame([
@@ -167,6 +186,48 @@ class QwenHardeningTests(unittest.TestCase):
         config = {"profile": {"eval_generation_samples": 4, "max_seq_length": 512}, "generation_sample_count": 4, "generation_max_new_tokens": 128, "learning_rate": 5e-5}
         changed = {"profile": {"eval_generation_samples": 40, "max_seq_length": 512}, "generation_sample_count": 40, "generation_max_new_tokens": 256, "learning_rate": 5e-5}
         self.assertEqual(qwen.training_fingerprint(config), qwen.training_fingerprint(changed))
+
+    def test_split_membership_uses_ids_not_mutable_content_and_stays_disjoint(self) -> None:
+        rows = [{"conversation_id": f"id-{index}", "digest": f"digest-{index}", "language": "en"} for index in range(30)]
+        original = qwen.split_conversations(rows, 42, (0.8, 0.1, 0.1), None)
+        changed = [dict(row, digest=f"changed-{row['conversation_id']}") for row in rows]
+        rewritten = qwen.split_conversations(changed, 42, (0.8, 0.1, 0.1), None)
+        assignment = {row["conversation_id"]: split for split, values in original.items() for row in values}
+        rewritten_assignment = {row["conversation_id"]: split for split, values in rewritten.items() for row in values}
+        self.assertEqual(assignment, rewritten_assignment)
+        self.assertEqual(set(assignment), {row["conversation_id"] for row in rows})
+        train_ids = {row["conversation_id"] for row in original["train"]}
+        validation_ids = {row["conversation_id"] for row in original["validation"]}
+        test_ids = {row["conversation_id"] for row in original["test"]}
+        self.assertTrue(train_ids.isdisjoint(validation_ids))
+        self.assertTrue(train_ids.isdisjoint(test_ids))
+        self.assertTrue(validation_ids.isdisjoint(test_ids))
+        remaining = [row for row in rows if row["conversation_id"] != "id-29"]
+        reduced = qwen.split_conversations(remaining, 42, (0.8, 0.1, 0.1), None)
+        reduced_assignment = {row["conversation_id"]: split for split, values in reduced.items() for row in values}
+        self.assertEqual({key: value for key, value in assignment.items() if key != "id-29"}, reduced_assignment)
+        other_seed = qwen.split_conversations(rows, 99, (0.8, 0.1, 0.1), None)
+        other_assignment = {row["conversation_id"]: split for split, values in other_seed.items() for row in values}
+        self.assertNotEqual(assignment, other_assignment)
+
+    def test_frozen_ids_are_forced_into_test_quota(self) -> None:
+        rows = [{"conversation_id": f"id-{index}", "digest": f"digest-{index}", "language": "en"} for index in range(30)]
+        splits = qwen.split_conversations(rows, 42, (0.8, 0.1, 0.1), None, frozen_eval_ids={"id-1", "id-2"})
+        self.assertIn("id-1", {row["conversation_id"] for row in splits["test"]})
+        self.assertIn("id-2", {row["conversation_id"] for row in splits["test"]})
+        self.assertNotIn("id-1", {row["conversation_id"] for row in splits["train"] + splits["validation"]})
+
+    def test_frozen_id_manifest_rejects_duplicates_and_is_fingerprinted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frozen-ids.txt"
+            path.write_text("id-2\nid-1\nid-2\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                qwen.read_frozen_eval_ids(path)
+            path.write_text("id-2\nid-1\n", encoding="utf-8")
+            ids, meta = qwen.read_frozen_eval_ids(path)
+            self.assertEqual(ids, {"id-1", "id-2"})
+            self.assertEqual(meta["sha256"], qwen.file_sha256(path))
+            self.assertEqual(len(qwen.ids_manifest_sha256(ids)), 64)
 
 
 if __name__ == "__main__":

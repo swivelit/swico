@@ -21,8 +21,10 @@
 - Added deterministic severe repeated-4-gram dataset filtering and `prepared/data_quality.json` reporting without rewriting user/assistant answers.
 - Added `SWICO_QWEN_MAX_CONVERSATIONS=all`, explicit cap provenance, and separated training fingerprints from post-training evaluation controls.
 - Added per-language generation health gates, missing-bucket failures, repetition/script checks, and a separate manual-review-required candidate status.
-- Added tokenizer-only truncation diagnostics with supervised-token retention by language while leaving sequence length at 512.
+- Added tokenizer-only truncation diagnostics with supervised-token retention by language; the checked-in V2 VM override is 768 based on the real audit.
 - Added evaluation-only base/candidate/optional champion comparison and existing-adapter HF merge/GGUF export workflows.
+- Fixed legacy V1 `en,<language>` benchmark metadata resolution; added model-free language counts and V1/V2 ID intersection utilities.
+- Changed split assignment to conversation-ID-stable ordering, added frozen evaluation ID manifests, and set the checked-in V2 VM sequence-length override to 768 after the real truncation audit.
 
 ## 4.0.0 — timestamped experiments and adaptive resource protection
 
