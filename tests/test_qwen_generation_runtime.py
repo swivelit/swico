@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import unittest
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ WANTED = {
 NODES = [node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name in WANTED]
 MODULE = ast.Module(body=NODES, type_ignores=[])
 ast.fix_missing_locations(MODULE)
-NS: dict[str, object] = {"torch": torch, "Any": Any}
+NS: dict[str, object] = {"torch": torch, "Any": Any, "hashlib": hashlib}
 exec(compile(MODULE, str(ROOT / "qwen_train_vm.py"), "exec"), NS)
 generate_samples = NS["generate_samples"]
 

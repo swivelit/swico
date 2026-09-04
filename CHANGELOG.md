@@ -14,6 +14,16 @@
 - Documented adapter-only and optional merged export; merged-model speed must be benchmarked rather than assumed.
 # Changelog
 
+## 2026-09-04 — Qwen pipeline hardening
+
+- Made Qwen generation evaluation default to `max_new_tokens=256`; smoke selects 4 samples and VM selects 40 deterministic language-stratified samples.
+- Centralized `en`, `ta`, `tanglish`, and ta-en semantics, normalized the incorrect ta-en system instruction during preparation, and added script/style validation.
+- Added deterministic severe repeated-4-gram dataset filtering and `prepared/data_quality.json` reporting without rewriting user/assistant answers.
+- Added `SWICO_QWEN_MAX_CONVERSATIONS=all`, explicit cap provenance, and separated training fingerprints from post-training evaluation controls.
+- Added per-language generation health gates, missing-bucket failures, repetition/script checks, and a separate manual-review-required candidate status.
+- Added tokenizer-only truncation diagnostics with supervised-token retention by language while leaving sequence length at 512.
+- Added evaluation-only base/candidate/optional champion comparison and existing-adapter HF merge/GGUF export workflows.
+
 ## 4.0.0 — timestamped experiments and adaptive resource protection
 
 - Added timestamped run directories under `SWICO_OUTPUT_ROOT/runs/`.

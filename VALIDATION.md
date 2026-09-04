@@ -48,7 +48,10 @@ Static validation also covers:
 - memory guard callback
 - adapter and final-report export paths
 - native Qwen assistant-mask and end-of-message supervision, including truncation protection
-- stratified 30-sample generation metrics and unhealthy-candidate reporting
+- canonical language validation, ta-en normalization, Tanglish/script checks and severe repetition audit
+- stratified 4-sample smoke / 40-sample VM generation metrics with per-language unhealthy-candidate reporting
+- tokenization/truncation audit without model loading or training
+- evaluation-only base/adapter/champion comparison and candidate promotion status
 
 Target-VM validation:
 
@@ -58,6 +61,16 @@ Target-VM validation:
 SWICO_QWEN_PREPARE_ONLY=true ./run_qwen_training.sh
 SWICO_QWEN_PROFILE=smoke ./run_qwen_training.sh
 ```
+
+Tokenization-only audit on the target VM:
+
+```bash
+SWICO_QWEN_AUDIT_TOKENIZATION=true ./run_qwen_training.sh
+```
+
+This loads the Qwen tokenizer but not the model and writes `prepared/data_quality.json` and `prepared/tokenization_audit.json`. It does not change the 512-token setting.
+
+The checked-in VM environment keeps the conservative 12,000-conversation profile cap. To use all available prepared conversations while retaining the VM hyperparameters, run `SWICO_QWEN_PROFILE=vm SWICO_QWEN_MAX_CONVERSATIONS=all ./run_qwen_training.sh`.
 
 After the smoke run:
 

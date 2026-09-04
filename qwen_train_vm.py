@@ -73,8 +73,14 @@ os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 import pandas as pd
 import psutil
 import torch
-from datasets import Dataset
-from peft import LoraConfig, PeftModel, get_peft_model
+try:
+    from datasets import Dataset
+except ImportError:  # Allows config/CSV audits to run before the full VM install.
+    Dataset = None  # type: ignore[assignment,misc]
+try:
+    from peft import LoraConfig, PeftModel, get_peft_model
+except ImportError:  # Training-only dependency; print-config and prepare-only remain usable.
+    LoraConfig = PeftModel = get_peft_model = None  # type: ignore[assignment]
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -86,10 +92,32 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 
-SCRIPT_VERSION = "1.0.0-qwen3-cpu-lora"
+SCRIPT_VERSION = "1.1.0-qwen3-cpu-lora-hardening"
 BASE_MODEL = "Qwen/Qwen3-0.6B"
 REQUIRED_COLUMNS = ("conversation_id", "turn_index", "role", "content", "language")
 VALID_ROLES = {"system", "user", "assistant"}
+ALL_CONVERSATIONS = -1
+CANONICAL_LANGUAGES = ("en", "ta", "tanglish", "ta-en")
+LANGUAGE_BUCKETS = ("english", "tamil", "tanglish", "tamil-english-mixed")
+LANGUAGE_DEFINITIONS = {
+    "en": "English",
+    "ta": "Tamil written primarily in Tamil script",
+    "tanglish": "Tamil expressed using English/Latin letters, with natural English mixing where appropriate",
+    "ta-en": "Natural Tamil-English mixed text using Tamil script plus English where appropriate, matching the user's language style",
+}
+CANONICAL_SYSTEM_PROMPTS = {
+    "en": "You are Swico, a helpful AI assistant. Understand the user's question and provide a simple, clear, accurate, and relevant answer in English.",
+    "ta": "You are Swico, a helpful AI assistant. Understand the user's question and provide a simple, clear, accurate, and relevant answer in Tamil.",
+    "tanglish": "You are Swico, a helpful AI assistant. Understand the user's question and provide a simple, clear, accurate, and relevant answer in tanglish.",
+    "ta-en": "You are Swico, a helpful AI assistant. Understand the user's question and provide a simple, clear, accurate, and relevant answer using a natural mix of Tamil script and English that matches the user's language style.",
+}
+DEFAULT_DATA_QUALITY_REPETITION_THRESHOLD = 0.30
+DEFAULT_GENERATION_HEALTH_THRESHOLDS = {
+    "min_termination_rate": 0.95,
+    "max_max_token_hit_rate": 0.05,
+    "max_repeated_4gram_ratio": 0.20,
+    "require_script_adherence": True,
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -106,9 +134,9 @@ class Profile:
 
 
 PROFILES: dict[str, Profile] = {
-    "smoke": Profile("smoke", 64, 1.0, 1, 4, 512, 1, 1, 1),
-    "vm": Profile("vm", 12_000, 2.0, 1, 16, 512, 30, 250, 250),
-    "full": Profile("full", None, 3.0, 1, 16, 768, 30, 250, 250),
+    "smoke": Profile("smoke", 64, 1.0, 1, 4, 512, 4, 1, 1),
+    "vm": Profile("vm", 12_000, 2.0, 1, 16, 512, 40, 250, 250),
+    "full": Profile("full", None, 3.0, 1, 16, 768, 40, 250, 250),
 }
 
 
@@ -227,6 +255,48 @@ def _split_csv_text(value: str) -> tuple[str, ...]:
     return items
 
 
+def parse_conversation_cap(value: str | int | None) -> int | None:
+    """Parse ``auto``, a positive cap, or the explicit ``all`` sentinel."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        if value == ALL_CONVERSATIONS or value > 0:
+            return value
+        raise argparse.ArgumentTypeError("conversation cap must be a positive integer, auto, or all")
+    text = str(value).strip().lower()
+    if text in {"", "auto", "default", "none", "null"}:
+        return None
+    if text == "all":
+        return ALL_CONVERSATIONS
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "conversation cap must be a positive integer, auto, or all"
+        ) from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("conversation cap must be a positive integer, auto, or all")
+    return parsed
+
+
+def conversation_cap_source(value: int | None) -> str:
+    if value == ALL_CONVERSATIONS:
+        return "explicit all"
+    return "explicit integer" if value is not None else "profile default"
+
+
+def conversation_cap_request(value: int | None) -> str | int:
+    return "all" if value == ALL_CONVERSATIONS else (value if value is not None else "auto")
+
+
+def quality_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "metric": "word-level repeated 4-gram ratio",
+        "severe_repetition_threshold": args.data_quality_repetition_threshold,
+        "action": "exclude conversation when any assistant response exceeds threshold",
+    }
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="CPU-only LoRA SFT for Qwen/Qwen3-0.6B conversational training.",
@@ -249,7 +319,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_RESUME", True))
     parser.add_argument("--prepare-only", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_PREPARE_ONLY", False))
 
-    parser.add_argument("--max-conversations", type=int, default=env_optional_int("SWICO_QWEN_MAX_CONVERSATIONS"))
+    try:
+        env_conversation_cap = parse_conversation_cap(os.environ.get("SWICO_QWEN_MAX_CONVERSATIONS"))
+    except argparse.ArgumentTypeError as exc:
+        raise ConfigError(f"SWICO_QWEN_MAX_CONVERSATIONS: {exc}") from exc
+    parser.add_argument(
+        "--max-conversations",
+        type=parse_conversation_cap,
+        default=env_conversation_cap,
+        help="auto/profile cap, a positive integer, or all",
+    )
     parser.add_argument("--train-split-fraction", type=float, default=env_float("SWICO_QWEN_TRAIN_SPLIT_FRACTION", 0.80))
     parser.add_argument("--validation-split-fraction", type=float, default=env_float("SWICO_QWEN_VALIDATION_SPLIT_FRACTION", 0.10))
     parser.add_argument("--test-split-fraction", type=float, default=env_float("SWICO_QWEN_TEST_SPLIT_FRACTION", 0.10))
@@ -286,7 +365,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--load-best-model-at-end", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_LOAD_BEST_MODEL_AT_END", True))
     parser.add_argument("--merge-adapter", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_MERGE_ADAPTER", False))
     parser.add_argument("--eval-generation-samples", type=int, default=env_optional_int("SWICO_QWEN_EVAL_GENERATION_SAMPLES"))
-    parser.add_argument("--generation-max-new-tokens", type=int, default=env_int("SWICO_QWEN_GENERATION_MAX_NEW_TOKENS", 128))
+    parser.add_argument("--generation-max-new-tokens", type=int, default=env_int("SWICO_QWEN_GENERATION_MAX_NEW_TOKENS", 256))
+    parser.add_argument("--data-quality-repetition-threshold", type=float, default=env_float("SWICO_QWEN_DATA_QUALITY_REPETITION_THRESHOLD", DEFAULT_DATA_QUALITY_REPETITION_THRESHOLD))
+    parser.add_argument("--audit-tokenization", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_AUDIT_TOKENIZATION", False))
+    parser.add_argument("--min-language-termination-rate", type=float, default=env_float("SWICO_QWEN_HEALTH_MIN_TERMINATION_RATE", DEFAULT_GENERATION_HEALTH_THRESHOLDS["min_termination_rate"]))
+    parser.add_argument("--max-language-max-token-hit-rate", type=float, default=env_float("SWICO_QWEN_HEALTH_MAX_TOKEN_HIT_RATE", DEFAULT_GENERATION_HEALTH_THRESHOLDS["max_max_token_hit_rate"]))
+    parser.add_argument("--max-language-repeated-4gram-ratio", type=float, default=env_float("SWICO_QWEN_HEALTH_MAX_REPEATED_4GRAM_RATIO", DEFAULT_GENERATION_HEALTH_THRESHOLDS["max_repeated_4gram_ratio"]))
+    parser.add_argument("--require-language-script-adherence", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_HEALTH_REQUIRE_SCRIPT_ADHERENCE", True))
 
     parser.add_argument("--memory-guard", action=argparse.BooleanOptionalAction, default=env_bool("SWICO_QWEN_MEMORY_GUARD", True))
     parser.add_argument("--memory-guard-interval-steps", type=int, default=env_int("SWICO_QWEN_MEMORY_GUARD_INTERVAL_STEPS", 5))
@@ -302,7 +387,10 @@ def resolve_profile(args: argparse.Namespace) -> Profile:
     base = PROFILES[args.profile]
     return dataclasses.replace(
         base,
-        max_conversations=args.max_conversations if args.max_conversations is not None else base.max_conversations,
+        max_conversations=(
+            None if args.max_conversations == ALL_CONVERSATIONS
+            else args.max_conversations if args.max_conversations is not None else base.max_conversations
+        ),
         epochs=args.epochs if args.epochs is not None else base.epochs,
         batch_size=args.batch_size if args.batch_size is not None else base.batch_size,
         gradient_accumulation_steps=(
@@ -338,6 +426,14 @@ def validate_config(args: argparse.Namespace, profile: Profile) -> None:
         raise ConfigError("learning rate and max grad norm must be positive")
     if args.generation_max_new_tokens <= 0:
         raise ConfigError("generation max new tokens must be positive")
+    if args.data_quality_repetition_threshold <= 0 or args.data_quality_repetition_threshold > 1:
+        raise ConfigError("data quality repetition threshold must be in (0, 1]")
+    if not 0 <= args.min_language_termination_rate <= 1:
+        raise ConfigError("minimum language termination rate must be in [0, 1]")
+    if not 0 <= args.max_language_max_token_hit_rate <= 1:
+        raise ConfigError("maximum language max-token-hit rate must be in [0, 1]")
+    if not 0 <= args.max_language_repeated_4gram_ratio <= 1:
+        raise ConfigError("maximum language repeated-4gram ratio must be in [0, 1]")
     if not 0 <= args.lora_dropout < 1:
         raise ConfigError("LoRA dropout must be in [0, 1)")
     if args.lora_r <= 0 or args.lora_alpha <= 0:
@@ -368,10 +464,10 @@ def qwen_effective_config(args: argparse.Namespace, profile: Profile) -> dict[st
         "offline": args.offline,
         "splits": [args.train_split_fraction, args.validation_split_fraction, args.test_split_fraction],
         "max_conversations": {
-            "requested_override": args.max_conversations,
+            "requested_override": conversation_cap_request(args.max_conversations),
             "profile_default": profile_default.max_conversations,
             "effective": profile.max_conversations,
-            "source": "explicit override" if args.max_conversations is not None else "profile default",
+            "source": conversation_cap_source(args.max_conversations),
         },
         "max_seq_length": profile.max_seq_length,
         "epochs": profile.epochs,
@@ -399,7 +495,24 @@ def qwen_effective_config(args: argparse.Namespace, profile: Profile) -> dict[st
         "early_stopping_threshold": args.early_stopping_threshold,
         "load_best_model_at_end": args.load_best_model_at_end,
         "merge_adapter": args.merge_adapter,
+        "generation_sample_count": profile.eval_generation_samples,
         "generation_max_new_tokens": args.generation_max_new_tokens,
+        "generation_health_thresholds": {
+            "min_language_termination_rate": args.min_language_termination_rate,
+            "max_language_max_token_hit_rate": args.max_language_max_token_hit_rate,
+            "max_language_repeated_4gram_ratio": args.max_language_repeated_4gram_ratio,
+            "require_language_script_adherence": args.require_language_script_adherence,
+        },
+        "data_quality": {
+            "repetition_metric": "word-level repeated 4-gram ratio",
+            "severe_repetition_threshold": args.data_quality_repetition_threshold,
+        },
+        "language_validation": {
+            "canonical_languages": list(CANONICAL_LANGUAGES),
+            "definitions": LANGUAGE_DEFINITIONS,
+            "system_prompt_normalization": "derive from coherent non-system language and replace system content deterministically",
+        },
+        "audit_tokenization": args.audit_tokenization,
         "memory_guard": args.memory_guard,
         "emergency_available_memory_gib": args.emergency_available_memory_gib,
         "max_process_rss_gib": args.max_process_rss_gib,
@@ -411,6 +524,16 @@ def training_fingerprint(config: dict[str, Any], data_hash: str | None = None) -
     material.pop("output", None)
     material.pop("run_mode", None)
     material.pop("run_label", None)
+    # Generation/reporting controls are post-training configuration.  They
+    # must not make a compatible interrupted training checkpoint unresumable.
+    material.pop("generation_max_new_tokens", None)
+    material.pop("generation_sample_count", None)
+    material.pop("generation_health_thresholds", None)
+    material.pop("merge_adapter", None)
+    material.pop("audit_tokenization", None)
+    if isinstance(material.get("profile"), dict):
+        material["profile"] = dict(material["profile"])
+        material["profile"].pop("eval_generation_samples", None)
     if data_hash:
         material["data_sha256"] = data_hash
     return stable_hash(json.dumps(material, sort_keys=True, ensure_ascii=False))
@@ -542,6 +665,63 @@ def normalize_content(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value).replace("\x00", " ")).strip()
 
 
+def canonical_language(value: Any) -> str:
+    """Return the one canonical non-system language code used by Qwen."""
+    aliases = {
+        "en": "en",
+        "english": "en",
+        "ta": "ta",
+        "tamil": "ta",
+        "tanglish": "tanglish",
+        "ta-en": "ta-en",
+        "ta_en": "ta-en",
+        "tamil-english-mixed": "ta-en",
+    }
+    normalized = normalize_content(value).lower()
+    canonical = aliases.get(normalized)
+    if canonical not in CANONICAL_LANGUAGES:
+        raise ValueError(
+            f"Unsupported Qwen language {value!r}; expected one of {', '.join(CANONICAL_LANGUAGES)}"
+        )
+    return canonical
+
+
+def has_tamil_script(text: str) -> bool:
+    return any("\u0b80" <= character <= "\u0bff" for character in text)
+
+
+def has_latin_letters(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", text))
+
+
+def validate_language_style(language: str, messages: list[dict[str, str]], *, context: str = "conversation") -> None:
+    """Validate broad script/style expectations without rejecting acronyms or punctuation."""
+    text = "\n".join(message["content"] for message in messages if message["role"] != "system")
+    tamil = has_tamil_script(text)
+    latin = has_latin_letters(text)
+    valid = {
+        "en": not tamil,
+        "ta": tamil,
+        "tanglish": not tamil,
+        "ta-en": tamil and latin,
+    }[language]
+    if not valid:
+        raise ValueError(
+            f"{context} language/style mismatch for {language}: "
+            f"tamil_script={tamil}, latin_letters={latin}"
+        )
+
+
+def word_tokens(text: str) -> list[str]:
+    return re.findall(r"[^\W_]+(?:['’][^\W_]+)?", text.lower(), flags=re.UNICODE)
+
+
+def repeated_4gram_ratio(text: str) -> float:
+    words = word_tokens(text)
+    grams = [tuple(words[index : index + 4]) for index in range(max(0, len(words) - 3))]
+    return (len(grams) - len(set(grams))) / len(grams) if grams else 0.0
+
+
 def validate_and_group_conversations(frame: pd.DataFrame) -> list[dict[str, Any]]:
     missing = set(REQUIRED_COLUMNS) - set(frame.columns)
     if missing:
@@ -549,13 +729,15 @@ def validate_and_group_conversations(frame: pd.DataFrame) -> list[dict[str, Any]
     frame = frame[list(REQUIRED_COLUMNS)].copy()
     frame["conversation_id"] = frame["conversation_id"].map(normalize_content)
     frame["role"] = frame["role"].map(lambda value: normalize_content(value).lower())
-    frame["content"] = frame["content"].map(lambda value: str(value).strip())
+    # Content is carried through verbatim.  Only the emptiness check below
+    # trims a temporary view; user/assistant answer text is never rewritten.
+    frame["content"] = frame["content"].map(lambda value: str(value))
     frame["language"] = frame["language"].map(normalize_content)
     try:
         frame["turn_index"] = frame["turn_index"].astype(int)
     except Exception as exc:
         raise ValueError("turn_index must contain integers") from exc
-    frame = frame[(frame["conversation_id"] != "") & (frame["content"] != "")].copy()
+    frame = frame[(frame["conversation_id"] != "") & (frame["content"].map(lambda value: value.strip()) != "")].copy()
     if frame.empty:
         raise ValueError("Qwen dataset contains no non-empty messages")
     invalid_roles = sorted(set(frame["role"]) - VALID_ROLES)
@@ -574,10 +756,29 @@ def validate_and_group_conversations(frame: pd.DataFrame) -> list[dict[str, Any]
             raise ValueError(f"Conversation {conversation_id} must contain at least one user and assistant message")
         if any(role == "system" for role in roles[1:]):
             raise ValueError(f"Conversation {conversation_id}: system message is only allowed first")
+        non_system_languages = {
+            canonical_language(row.language)
+            for row in group.itertuples(index=False)
+            if str(row.role) != "system"
+        }
+        if len(non_system_languages) != 1:
+            raise ValueError(
+                f"Conversation {conversation_id} must have one coherent non-system language; "
+                f"found {sorted(non_system_languages)}"
+            )
+        language = next(iter(non_system_languages))
         messages = [
             {"role": str(row.role), "content": str(row.content)}
             for row in group.itertuples(index=False)
         ]
+        validate_language_style(language, messages, context=f"conversation {conversation_id}")
+        normalized_system_prompt_count = 0
+        for message in messages:
+            if message["role"] == "system":
+                canonical_prompt = CANONICAL_SYSTEM_PROMPTS[language]
+                if message["content"] != canonical_prompt:
+                    normalized_system_prompt_count += 1
+                message["content"] = canonical_prompt
         serialized = json.dumps(messages, ensure_ascii=False, sort_keys=True)
         digest = stable_hash(serialized)
         if digest in seen_hashes:
@@ -587,13 +788,69 @@ def validate_and_group_conversations(frame: pd.DataFrame) -> list[dict[str, Any]
             {
                 "conversation_id": str(conversation_id),
                 "messages": messages,
-                "language": ",".join(sorted(set(group["language"].astype(str)) - {""})),
+                "language": language,
                 "digest": digest,
+                "system_prompt_normalized_count": normalized_system_prompt_count,
             }
         )
     if len(conversations) < 3:
         raise ValueError("At least 3 unique conversations are required for train/validation/test splitting")
     return conversations
+
+
+def audit_conversation_quality(
+    conversations: list[dict[str, Any]], threshold: float = DEFAULT_DATA_QUALITY_REPETITION_THRESHOLD
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Exclude only conversations with clearly pathological assistant repetition."""
+    if not 0 < threshold <= 1:
+        raise ValueError("repetition threshold must be in (0, 1]")
+    by_language = {
+        language: {"conversations_seen": 0, "conversations_excluded": 0, "assistant_messages_seen": 0, "assistant_messages_excluded": 0}
+        for language in CANONICAL_LANGUAGES
+    }
+    suspicious_messages: list[dict[str, Any]] = []
+    excluded_ids: set[str] = set()
+    for conversation in conversations:
+        language = conversation["language"]
+        by_language[language]["conversations_seen"] += 1
+        for index, message in enumerate(conversation["messages"]):
+            if message["role"] != "assistant":
+                continue
+            by_language[language]["assistant_messages_seen"] += 1
+            ratio = repeated_4gram_ratio(message["content"])
+            if ratio > threshold:
+                excluded_ids.add(conversation["conversation_id"])
+                by_language[language]["assistant_messages_excluded"] += 1
+                suspicious_messages.append(
+                    {
+                        "conversation_id": conversation["conversation_id"],
+                        "assistant_message_index": index,
+                        "language": language,
+                        "repeated_4gram_ratio": round(ratio, 6),
+                        "reason": "word-level repeated-4gram ratio above severe threshold",
+                    }
+                )
+    filtered = []
+    for conversation in conversations:
+        if conversation["conversation_id"] in excluded_ids:
+            by_language[conversation["language"]]["conversations_excluded"] += 1
+        else:
+            filtered.append(conversation)
+    report = {
+        "metric": "word-level repeated 4-gram ratio",
+        "severe_repetition_threshold": threshold,
+        "conversations_seen": len(conversations),
+        "conversations_excluded": len(excluded_ids),
+        "assistant_messages_flagged": len(suspicious_messages),
+        "excluded_conversation_ids": sorted(excluded_ids),
+        "by_language": by_language,
+        "suspicious_assistant_messages": sorted(
+            suspicious_messages,
+            key=lambda item: (-item["repeated_4gram_ratio"], item["conversation_id"], item["assistant_message_index"]),
+        ),
+        "content_action": "pathological conversations excluded; user and assistant content was not rewritten",
+    }
+    return filtered, report
 
 
 def split_conversations(
@@ -630,7 +887,11 @@ def prepare_dataset(
     if not data_path.exists():
         raise FileNotFoundError(f"Qwen dataset does not exist: {data_path}")
     frame = pd.read_csv(data_path, dtype=str, keep_default_na=False, quoting=csv.QUOTE_MINIMAL)
-    conversations = validate_and_group_conversations(frame)
+    conversations_before_quality = validate_and_group_conversations(frame)
+    conversations, quality_report = audit_conversation_quality(
+        conversations_before_quality,
+        threshold=args.data_quality_repetition_threshold,
+    )
     splits = split_conversations(
         conversations,
         seed=args.seed,
@@ -639,6 +900,7 @@ def prepare_dataset(
     )
     prepared = output / "prepared"
     prepared.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(prepared / "data_quality.json", quality_report)
     for split_name, values in splits.items():
         with (prepared / f"{split_name}.jsonl").open("w", encoding="utf-8") as handle:
             for item in values:
@@ -655,13 +917,27 @@ def prepare_dataset(
         "source": str(data_path),
         "source_sha256": file_sha256(data_path),
         "raw_message_rows": int(len(frame)),
-        "unique_conversations_after_dedup": len(conversations),
-        "max_conversations_cap_requested": args.max_conversations,
+        "unique_conversations_after_dedup": len(conversations_before_quality),
+        "conversations_after_quality_filter": len(conversations),
+        "data_quality_excluded_conversations": quality_report["conversations_excluded"],
+        "data_quality_excluded_assistant_messages": quality_report["assistant_messages_flagged"],
+        "system_prompts_normalized": sum(
+            int(item.get("system_prompt_normalized_count", 0)) for item in conversations_before_quality
+        ),
+        "system_prompt_normalization": {
+            "version": SCRIPT_VERSION,
+            "canonical_languages": list(CANONICAL_LANGUAGES),
+            "normalized_system_prompt_rows": sum(
+                int(item.get("system_prompt_normalized_count", 0)) for item in conversations_before_quality
+            ),
+            "normalized_conversations": sum(
+                int(item.get("system_prompt_normalized_count", 0)) > 0 for item in conversations_before_quality
+            ),
+        },
+        "max_conversations_cap_requested": conversation_cap_request(args.max_conversations),
         "max_conversations_cap_profile_default": PROFILES[args.profile].max_conversations,
         "max_conversations_cap_effective": profile.max_conversations,
-        "max_conversations_cap_source": (
-            "explicit override" if args.max_conversations is not None else "profile default"
-        ),
+        "max_conversations_cap_source": conversation_cap_source(args.max_conversations),
         "selected_conversations_before_split": sum(len(values) for values in splits.values()),
         "conversations_excluded_by_cap": max(
             0, len(conversations) - sum(len(values) for values in splits.values())
@@ -677,7 +953,7 @@ def prepare_dataset(
     )
     if profile.max_conversations is not None and len(conversations) > profile.max_conversations:
         logger.info(
-            "Conversation cap is explicit: dataset has %d deduplicated conversations; profile selects %d",
+            "Conversation cap is active: dataset has %d quality-filtered conversations; profile selects %d",
             len(conversations),
             profile.max_conversations,
         )
@@ -701,7 +977,14 @@ def apply_template(tokenizer, messages: list[dict[str, str]], *, tokenize: bool,
         return tokenizer.apply_chat_template(messages, tokenize=tokenize, **kwargs)
 
 
-def assistant_only_tokens(tokenizer, messages: list[dict[str, str]], max_seq_length: int) -> tuple[list[int], list[int]]:
+def assistant_only_tokens(
+    tokenizer,
+    messages: list[dict[str, str]],
+    max_seq_length: int,
+    *,
+    return_diagnostics: bool = False,
+    allow_prompt_only: bool = False,
+) -> tuple[list[int], list[int]] | tuple[list[int], list[int], dict[str, object]]:
     """Label assistant content plus the Qwen end-of-message token.
 
     Current Transformers/Qwen templates expose native assistant generation
@@ -784,7 +1067,7 @@ def assistant_only_tokens(tokenizer, messages: list[dict[str, str]], max_seq_len
     if native_ids is not None and native_mask is not None:
         if len(native_ids) != len(native_mask):
             raise ValueError("Qwen tokenizer returned mismatched input_ids and assistant mask lengths")
-        labels = [token_id if mask else -100 for token_id, mask in zip(native_ids, native_mask, strict=True)]
+        labels = [token_id if mask else -100 for token_id, mask in zip(native_ids, native_mask)]
         label_termination(native_ids, labels, native_mask)
         ids = native_ids
     else:
@@ -836,7 +1119,7 @@ def assistant_only_tokens(tokenizer, messages: list[dict[str, str]], max_seq_len
             raise ValueError("Tokenizer returned mismatched input_ids and offset_mapping lengths")
         fallback_mask: list[int] = []
         labels = []
-        for token_id, offset in zip(ids, offsets, strict=True):
+        for token_id, offset in zip(ids, offsets):
             token_start, token_end = int(offset[0]), int(offset[1])
             is_assistant = token_end > token_start and any(
                 token_start < span_end and token_end > span_start
@@ -846,23 +1129,125 @@ def assistant_only_tokens(tokenizer, messages: list[dict[str, str]], max_seq_len
             labels.append(token_id if is_assistant else -100)
         label_termination(ids, labels, fallback_mask)
 
+    pre_truncation_token_count = len(ids)
+    pre_truncation_supervised_tokens = sum(label != -100 for label in labels)
     ids = ids[-max_seq_length:]
     labels = labels[-max_seq_length:]
-    if not any(label != -100 for label in labels):
+    post_truncation_supervised_tokens = sum(label != -100 for label in labels)
+    if not any(label != -100 for label in labels) and not allow_prompt_only:
         raise ValueError(
             "A conversation has no assistant content or termination tokens after tokenization/truncation; "
             "increase SWICO_QWEN_MAX_SEQ_LENGTH"
         )
+    if return_diagnostics:
+        return ids, labels, {
+            "pre_truncation_token_count": pre_truncation_token_count,
+            "post_truncation_token_count": len(ids),
+            "truncated": pre_truncation_token_count > max_seq_length,
+            "assistant_supervised_tokens_before_truncation": pre_truncation_supervised_tokens,
+            "assistant_supervised_tokens_retained": post_truncation_supervised_tokens,
+            "supervised_token_retention_ratio": (
+                post_truncation_supervised_tokens / pre_truncation_supervised_tokens
+                if pre_truncation_supervised_tokens
+                else 0.0
+            ),
+        }
     return ids, labels
 
 
-def tokenize_split(tokenizer, rows: list[dict[str, Any]], max_seq_length: int) -> Dataset:
+def _tokenization_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if not records:
+        return {
+            "conversation_count": 0,
+            "pre_truncation_token_count": {"mean": None, "p50": None, "p90": None, "p95": None, "p99": None},
+            "post_truncation_token_count": {"mean": None, "p50": None, "p90": None, "p95": None, "p99": None},
+            "conversations_truncated": 0,
+            "truncation_rate": None,
+            "assistant_supervised_tokens_before_truncation": 0,
+            "assistant_supervised_tokens_retained": 0,
+            "supervised_token_retention_ratio": None,
+        }
+
+    def percentile(values: list[int], fraction: float) -> float:
+        values = sorted(values)
+        position = (len(values) - 1) * fraction
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return float(values[lower])
+        return values[lower] + (values[upper] - values[lower]) * (position - lower)
+
+    def distribution(key: str) -> dict[str, float]:
+        values = [int(item[key]) for item in records]
+        return {
+            "mean": sum(values) / len(values),
+            "p50": percentile(values, 0.50),
+            "p90": percentile(values, 0.90),
+            "p95": percentile(values, 0.95),
+            "p99": percentile(values, 0.99),
+        }
+
+    before = sum(int(item["assistant_supervised_tokens_before_truncation"]) for item in records)
+    retained = sum(int(item["assistant_supervised_tokens_retained"]) for item in records)
+    return {
+        "conversation_count": len(records),
+        "pre_truncation_token_count": distribution("pre_truncation_token_count"),
+        "post_truncation_token_count": distribution("post_truncation_token_count"),
+        "conversations_truncated": sum(bool(item["truncated"]) for item in records),
+        "truncation_rate": sum(bool(item["truncated"]) for item in records) / len(records),
+        "assistant_supervised_tokens_before_truncation": before,
+        "assistant_supervised_tokens_retained": retained,
+        "supervised_token_retention_ratio": retained / before if before else None,
+    }
+
+
+def tokenize_split(
+    tokenizer,
+    rows: list[dict[str, Any]],
+    max_seq_length: int,
+    diagnostics: dict[str, list[dict[str, Any]]] | None = None,
+    allow_prompt_only: bool = False,
+) -> Dataset:
+    if Dataset is None:
+        raise RuntimeError("datasets is required for Qwen tokenization; install requirements-cpu.txt")
     payload = {"input_ids": [], "labels": []}
     for row in rows:
-        ids, labels = assistant_only_tokens(tokenizer, row["messages"], max_seq_length)
+        result = assistant_only_tokens(
+            tokenizer,
+            row["messages"],
+            max_seq_length,
+            return_diagnostics=diagnostics is not None,
+            allow_prompt_only=allow_prompt_only,
+        )
+        if diagnostics is None:
+            ids, labels = result  # type: ignore[misc]
+        else:
+            ids, labels, stats = result  # type: ignore[misc]
+            stats = dict(stats)
+            stats["language"] = row["language"]
+            diagnostics.setdefault(row["language"], []).append(stats)
         payload["input_ids"].append(ids)
         payload["labels"].append(labels)
     return Dataset.from_dict(payload)
+
+
+def build_tokenization_audit(
+    diagnostics_by_language: dict[str, list[dict[str, Any]]],
+    *,
+    max_seq_length: int,
+    split_name: str,
+) -> dict[str, Any]:
+    return {
+        "split": split_name,
+        "max_seq_length": max_seq_length,
+        "by_language": {
+            language: _tokenization_summary(diagnostics_by_language.get(language, []))
+            for language in CANONICAL_LANGUAGES
+        },
+        "overall": _tokenization_summary(
+            [item for values in diagnostics_by_language.values() for item in values]
+        ),
+    }
 
 
 def bf16_dtype(enabled: bool) -> torch.dtype:
@@ -881,6 +1266,8 @@ def load_tokenizer(args: argparse.Namespace):
 
 
 def build_lora_model(args: argparse.Namespace, use_bf16: bool):
+    if LoraConfig is None or get_peft_model is None:
+        raise RuntimeError("peft is required for Qwen training; install requirements-cpu.txt")
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         local_files_only=args.offline,
@@ -964,12 +1351,12 @@ def count_trainable_parameters(model) -> dict[str, int | float]:
 
 
 def qwen_language_bucket(row: dict[str, Any]) -> str:
-    labels = {item.strip().lower() for item in str(row.get("language", "")).split(",") if item.strip()}
-    if "ta-en" in labels:
+    language = str(row.get("language", "en")).split(",")[0].strip().lower()
+    if language in {"ta-en", "ta_en", "tamil-english-mixed"}:
         return "tamil-english-mixed"
-    if "tanglish" in labels:
+    if language == "tanglish":
         return "tanglish"
-    if "ta" in labels:
+    if language == "ta":
         return "tamil"
     return "english"
 
@@ -1015,16 +1402,6 @@ def generate_samples(
         return []
     model.eval()
     samples: list[dict[str, Any]] = []
-    def language_bucket(row: dict[str, Any]) -> str:
-        labels = {item.strip().lower() for item in str(row.get("language", "")).split(",") if item.strip()}
-        if "ta-en" in labels:
-            return "tamil-english-mixed"
-        if "tanglish" in labels:
-            return "tanglish"
-        if "ta" in labels:
-            return "tamil"
-        return "english"
-
     termination_ids: set[int] = set()
     eos_id = getattr(tokenizer, "eos_token_id", None)
     if isinstance(eos_id, (list, tuple, set)):
@@ -1086,15 +1463,25 @@ def generate_samples(
         completion_ids = [int(token_id) for token_id in completion.detach().cpu().tolist()]
         produced_eos = any(token_id in termination_ids for token_id in completion_ids)
         output_token_count = len(completion_ids)
-        four_grams = [tuple(completion_ids[index : index + 4]) for index in range(max(0, output_token_count - 3))]
+        text = tokenizer.decode(completion, skip_special_tokens=True).strip()
+        words = __import__("re").findall(r"[^\W_]+(?:['’][^\W_]+)?", text.lower(), flags=__import__("re").UNICODE)
+        four_grams = [tuple(words[index : index + 4]) for index in range(max(0, len(words) - 3))]
         repeated_four_gram_ratio = (
             (len(four_grams) - len(set(four_grams))) / len(four_grams) if four_grams else 0.0
         )
-        text = tokenizer.decode(completion, skip_special_tokens=True).strip()
+        generated_has_tamil = any("\u0b80" <= character <= "\u0bff" for character in text)
+        generated_has_latin = bool(__import__("re").search(r"[A-Za-z]", text))
+        generated_bucket = qwen_language_bucket(row)
+        script_style_adherent = {
+            "english": not generated_has_tamil,
+            "tamil": generated_has_tamil,
+            "tanglish": not generated_has_tamil,
+            "tamil-english-mixed": generated_has_tamil and generated_has_latin,
+        }.get(generated_bucket, False)
         samples.append(
             {
                 "conversation_id": row["conversation_id"],
-                "language": language_bucket(row),
+                "language": qwen_language_bucket(row),
                 "prompt_last_message": prompt_messages[-1]["content"] if prompt_messages else "",
                 "expected": expected,
                 "generated": text,
@@ -1105,12 +1492,25 @@ def generate_samples(
                 "generation_time_seconds": generation_seconds,
                 "tokens_per_second": output_token_count / generation_seconds,
                 "repeated_4gram_ratio": repeated_four_gram_ratio,
+                "script_style_adherent": script_style_adherent,
             }
         )
     return samples
 
 
-def summarize_generation_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_generation_samples(
+    samples: list[dict[str, Any]], thresholds: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    thresholds = dict(
+        {
+            "min_termination_rate": 0.95,
+            "max_max_token_hit_rate": 0.05,
+            "max_repeated_4gram_ratio": 0.20,
+            "require_script_adherence": True,
+        }
+        if thresholds is None
+        else thresholds
+    )
     def summarize(values: list[dict[str, Any]]) -> dict[str, Any]:
         count = len(values)
         if not count:
@@ -1123,6 +1523,7 @@ def summarize_generation_samples(samples: list[dict[str, Any]]) -> dict[str, Any
                 "mean_generation_time_seconds": None,
                 "mean_tokens_per_second": None,
                 "mean_repeated_4gram_ratio": None,
+                "script_adherence_rate": None,
             }
         mean = lambda key: sum(float(item[key]) for item in values) / count
         return {
@@ -1134,6 +1535,7 @@ def summarize_generation_samples(samples: list[dict[str, Any]]) -> dict[str, Any
             "mean_generation_time_seconds": mean("generation_time_seconds"),
             "mean_tokens_per_second": mean("tokens_per_second"),
             "mean_repeated_4gram_ratio": mean("repeated_4gram_ratio"),
+            "script_adherence_rate": sum(bool(item.get("script_style_adherent", False)) for item in values) / count,
         }
 
     by_language = {
@@ -1142,16 +1544,38 @@ def summarize_generation_samples(samples: list[dict[str, Any]]) -> dict[str, Any
     }
     overall = summarize(samples)
     unhealthy_reasons = []
-    if overall["termination_rate"] is not None and overall["termination_rate"] < 0.95:
-        unhealthy_reasons.append("termination rate below 95%")
-    if overall["max_token_hit_rate"] is not None and overall["max_token_hit_rate"] > 0.05:
-        unhealthy_reasons.append("max-token-hit rate above 5%")
+    min_termination = float(thresholds["min_termination_rate"])
+    max_token_hit = float(thresholds["max_max_token_hit_rate"])
+    max_repetition = float(thresholds["max_repeated_4gram_ratio"])
+    if overall["termination_rate"] is not None and overall["termination_rate"] < min_termination:
+        unhealthy_reasons.append(f"termination rate below {min_termination:.0%}")
+    if overall["max_token_hit_rate"] is not None and overall["max_token_hit_rate"] > max_token_hit:
+        unhealthy_reasons.append(f"max-token-hit rate above {max_token_hit:.0%}")
+    if overall["mean_repeated_4gram_ratio"] is not None and overall["mean_repeated_4gram_ratio"] > max_repetition:
+        unhealthy_reasons.append("overall repeated-4gram ratio above threshold")
+    if thresholds.get("require_script_adherence", True) and overall["script_adherence_rate"] is not None and overall["script_adherence_rate"] < 1.0:
+        unhealthy_reasons.append("overall script adherence below threshold")
+    for language in ("english", "tamil", "tanglish", "tamil-english-mixed"):
+        summary = by_language[language]
+        if not summary["sample_count"]:
+            unhealthy_reasons.append(f"missing language bucket: {language}")
+            continue
+        if summary["termination_rate"] < min_termination:
+            unhealthy_reasons.append(f"{language} termination rate below threshold")
+        if summary["max_token_hit_rate"] > max_token_hit:
+            unhealthy_reasons.append(f"{language} max-token-hit rate above threshold")
+        if summary["mean_repeated_4gram_ratio"] > max_repetition:
+            unhealthy_reasons.append(f"{language} repeated-4gram ratio above threshold")
+        if thresholds.get("require_script_adherence", True) and summary["script_adherence_rate"] < 1.0:
+            unhealthy_reasons.append(f"{language} script adherence below threshold")
     return {
         "overall": overall,
         "by_language": by_language,
+        "thresholds": thresholds,
         "health": {
             "healthy": not unhealthy_reasons,
             "unhealthy_reasons": unhealthy_reasons,
+            "manual_quality_review_required": True,
         },
     }
 
@@ -1177,6 +1601,9 @@ def save_markdown_report(path: Path, report: dict[str, Any]) -> None:
         f"- Adapter path: `{report.get('adapter_path')}`",
         f"- Evaluated model: **{report.get('evaluated_model_status', 'unknown')}**",
         f"- Generation health: **{health_line}**",
+        f"- Generation evaluation: samples={report.get('effective_training_config', {}).get('generation_sample_count')}, max_new_tokens={report.get('effective_training_config', {}).get('generation_max_new_tokens')}",
+        f"- Manual quality review required: **{report.get('candidate_status', {}).get('manual_quality_review_required', True)}**",
+        f"- Promotion eligible: **{report.get('candidate_status', {}).get('promotion_eligible', False)}**",
         "",
         "## Effective training configuration",
         "",
@@ -1193,6 +1620,8 @@ def save_markdown_report(path: Path, report: dict[str, Any]) -> None:
         f"- BF16: supported={report.get('effective_training_config', {}).get('bf16_supported')}, enabled={report.get('effective_training_config', {}).get('bf16_enabled')}",
         f"- LoRA: {report.get('effective_training_config', {}).get('lora')}",
         f"- Export status: {report.get('effective_training_config', {}).get('merged_status')}",
+        f"- Data-quality exclusions: conversations={report.get('data_quality', {}).get('excluded_conversations')}, assistant messages={report.get('data_quality', {}).get('excluded_assistant_messages')}",
+        f"- Tokenization audit: `{report.get('effective_training_config', {}).get('tokenization_audit_path')}`",
         "",
         "## LoRA parameters",
         "",
@@ -1260,16 +1689,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_bf16 = bool(system["bf16_enabled"])
 
     splits, dataset_meta = prepare_dataset(data_path, output, profile, args, logger)
-    if args.prepare_only:
+    config["dataset_preparation"] = dataset_meta
+    atomic_write_json(output / "run_config.json", config)
+    if args.prepare_only and not args.audit_tokenization:
         atomic_write_json(output / "run_state.json", {"prepared": True, "final_evaluation_complete": False})
         logger.info("Prepare-only requested; stopping before model download/training")
         return 0
 
     tokenizer = load_tokenizer(args)
-    tokenized = {
-        name: tokenize_split(tokenizer, rows, profile.max_seq_length)
-        for name, rows in splits.items()
+    tokenized: dict[str, Dataset] = {}
+    tokenization_audit_by_split: dict[str, Any] = {}
+    all_diagnostics: dict[str, list[dict[str, Any]]] = {}
+    for name, rows in splits.items():
+        diagnostics: dict[str, list[dict[str, Any]]] = {}
+        tokenized[name] = tokenize_split(
+            tokenizer,
+            rows,
+            profile.max_seq_length,
+            diagnostics=diagnostics,
+            allow_prompt_only=args.audit_tokenization,
+        )
+        tokenization_audit_by_split[name] = build_tokenization_audit(
+            diagnostics, max_seq_length=profile.max_seq_length, split_name=name
+        )
+        for language, values in diagnostics.items():
+            all_diagnostics.setdefault(language, []).extend(values)
+    tokenization_audit = {
+        "version": SCRIPT_VERSION,
+        "max_seq_length": profile.max_seq_length,
+        "by_split": tokenization_audit_by_split,
+        "overall_by_language": {
+            language: _tokenization_summary(all_diagnostics.get(language, []))
+            for language in CANONICAL_LANGUAGES
+        },
+        "overall": _tokenization_summary(
+            [item for values in all_diagnostics.values() for item in values]
+        ),
     }
+    atomic_write_json(output / "prepared" / "tokenization_audit.json", tokenization_audit)
+    config["tokenization_audit"] = tokenization_audit
+    atomic_write_json(output / "run_config.json", config)
+    if args.audit_tokenization:
+        atomic_write_json(output / "run_state.json", {"prepared": True, "tokenization_audit_complete": True, "final_evaluation_complete": False})
+        logger.info("Tokenization audit requested; stopping before model download/training")
+        return 0
     logger.info(
         "Tokenized conversations: train=%d validation=%d test=%d max_seq_length=%d",
         len(tokenized["train"]), len(tokenized["validation"]), len(tokenized["test"]), profile.max_seq_length,
@@ -1346,7 +1809,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.generation_max_new_tokens,
         use_bf16,
     )
-    generation_evaluation = summarize_generation_samples(generation_samples)
+    generation_evaluation = summarize_generation_samples(
+        generation_samples,
+        thresholds={
+            "min_termination_rate": args.min_language_termination_rate,
+            "max_max_token_hit_rate": args.max_language_max_token_hit_rate,
+            "max_repeated_4gram_ratio": args.max_language_repeated_4gram_ratio,
+            "require_script_adherence": args.require_language_script_adherence,
+        },
+    )
     logger.info(
         "Held-out generation: %d samples, termination=%.1f%%, max-token-hit=%.1f%%",
         len(generation_samples),
@@ -1379,6 +1850,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         "evaluated_model_status": "adapter-based",
         "generation_samples": generation_samples,
         "generation_evaluation": generation_evaluation,
+        "tokenization_audit": tokenization_audit,
+        "data_quality": {
+            "report_path": str(output / "prepared" / "data_quality.json"),
+            "excluded_conversations": dataset_meta["data_quality_excluded_conversations"],
+            "excluded_assistant_messages": dataset_meta["data_quality_excluded_assistant_messages"],
+        },
+        "candidate_status": {
+            "training_completed": True,
+            "generation_healthy": generation_evaluation["health"]["healthy"],
+            "beats_base": None,
+            "does_not_regress_champion": None,
+            "manual_quality_review_required": True,
+            "automatic_promotion_gate_passed": False,
+            "promotion_eligible": False,
+            "reason": "Training completion and generation health do not establish factual quality or safe deployment; run base/champion comparison and manual review.",
+        },
         "effective_training_config": {
             "dataset_sha256": data_hash,
             "conversation_counts": dataset_meta["split_conversations"],
@@ -1408,6 +1895,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "bf16_supported": system["cpu_bf16_supported"],
             "bf16_enabled": system["bf16_enabled"],
             "merged_status": "merged export created" if merged_path else "adapter-only export; merged export disabled",
+            "generation_sample_count": len(generation_samples),
+            "generation_max_new_tokens": args.generation_max_new_tokens,
+            "generation_health_thresholds": generation_evaluation["thresholds"],
+            "language_validation": {
+                "canonical_languages": list(CANONICAL_LANGUAGES),
+                "definitions": LANGUAGE_DEFINITIONS,
+                "system_prompts_normalized": dataset_meta["system_prompts_normalized"],
+            },
+            "data_quality": quality_config_from_args(args),
+            "tokenization_audit_path": str(output / "prepared" / "tokenization_audit.json"),
         },
     }
     reports_dir = output / "reports"

@@ -4,7 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-if [ ! -x .venv/bin/python ]; then
+if [ -x .venv/bin/python ]; then
+  PYTHON_BIN=.venv/bin/python
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN=python
+  echo "Warning: .venv/bin/python is missing; using system python for config/audit commands." >&2
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+  echo "Warning: .venv/bin/python is missing; using system python3 for config/audit commands." >&2
+else
   echo "Training environment is missing. Run ./setup_vm.sh first."
   exit 1
 fi
@@ -26,7 +34,7 @@ for argument in "$@"; do
 done
 
 if [ "$HAS_ENV_FILE" = true ]; then
-  exec .venv/bin/python qwen_train_vm.py "$@"
+  exec "$PYTHON_BIN" qwen_train_vm.py "$@"
 fi
 
 ENV_FILE="${SWICO_QWEN_ENV_FILE:-$ROOT_DIR/qwen_training.env}"
@@ -36,4 +44,4 @@ if [ ! -f "$ENV_FILE" ]; then
   exit 1
 fi
 
-exec .venv/bin/python qwen_train_vm.py --env-file "$ENV_FILE" "$@"
+exec "$PYTHON_BIN" qwen_train_vm.py --env-file "$ENV_FILE" "$@"

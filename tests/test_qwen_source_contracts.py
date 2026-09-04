@@ -54,6 +54,14 @@ class QwenSourceContractTests(unittest.TestCase):
         self.assertIn('"max_token_hit_rate"', SOURCE)
         self.assertIn('"unhealthy_reasons"', SOURCE)
 
+    def test_hardening_defaults_and_audits_are_wired(self) -> None:
+        self.assertIn("SWICO_QWEN_GENERATION_MAX_NEW_TOKENS\", 256", SOURCE)
+        self.assertIn("ALL_CONVERSATIONS = -1", SOURCE)
+        self.assertIn("SWICO_QWEN_DATA_QUALITY_REPETITION_THRESHOLD", SOURCE)
+        self.assertIn("tokenization_audit.json", SOURCE)
+        self.assertIn("missing language bucket", SOURCE)
+        self.assertIn("manual_quality_review_required", SOURCE)
+
     def test_early_stopping_callback_is_removed_before_test_evaluation(self) -> None:
         self.assertIn('trainer.remove_callback(EarlyStoppingCallback)', SOURCE)
 

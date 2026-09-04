@@ -154,6 +154,13 @@ SUPPORTED_ENV_KEYS = frozenset(
         "SWICO_QWEN_MERGE_ADAPTER",
         "SWICO_QWEN_EVAL_GENERATION_SAMPLES",
         "SWICO_QWEN_GENERATION_MAX_NEW_TOKENS",
+        "SWICO_QWEN_DATA_QUALITY_REPETITION_THRESHOLD",
+        "SWICO_QWEN_AUDIT_TOKENIZATION",
+        "SWICO_QWEN_HEALTH_MIN_TERMINATION_RATE",
+        "SWICO_QWEN_HEALTH_MAX_TOKEN_HIT_RATE",
+        "SWICO_QWEN_HEALTH_MAX_REPEATED_4GRAM_RATIO",
+        "SWICO_QWEN_HEALTH_REQUIRE_SCRIPT_ADHERENCE",
+        "SWICO_QWEN_CHAMPION_ADAPTER",
         "SWICO_QWEN_MEMORY_GUARD",
         "SWICO_QWEN_MEMORY_GUARD_INTERVAL_STEPS",
         "SWICO_QWEN_EMERGENCY_AVAILABLE_MEMORY_GIB",
@@ -207,7 +214,8 @@ def initialize_environment(argv: Iterable[str] | None = None) -> Path | None:
 
     selected, explicit = _extract_env_file(sys.argv[1:] if argv is None else argv)
     if not selected.is_absolute():
-        selected = (Path.cwd() / selected).resolve()
+        selected = Path.cwd() / selected
+    selected = selected.resolve()
     if not selected.exists():
         if explicit:
             raise ConfigError(f"Configured env file does not exist: {selected}")

@@ -303,7 +303,16 @@ Required CSV columns:
 conversation_id,turn_index,role,content,language
 ```
 
-Messages with the same `conversation_id` are grouped into one conversation. Splitting happens at the complete-conversation level so turns from one conversation cannot leak across train, validation and test sets.
+Messages with the same `conversation_id` are grouped into one conversation. Splitting happens at the complete-conversation level so turns from one conversation cannot leak across train, validation and test sets. Preparation derives the language from non-system rows; an English-labeled system row does not make a Tamil conversation multilingual.
+
+Canonical language semantics are centralized in the trainer:
+
+- `en`: English
+- `ta`: Tamil written primarily in Tamil script
+- `tanglish`: Tamil expressed using English/Latin letters, with natural English mixing where appropriate
+- `ta-en`: natural Tamil-English mixed text using Tamil script plus English, matching the user's style
+
+The ta-en system instruction is normalized during preparation to the canonical Tamil-script-plus-English instruction. User and assistant content is not rewritten. The count is recorded in `prepared/metadata.json` and the normalization changes the training version/fingerprint.
 
 ## Qwen training method
 
@@ -315,8 +324,11 @@ The Qwen trainer uses:
 - LoRA / PEFT rather than full-weight fine-tuning
 - validation loss for early stopping and best-checkpoint restoration
 - held-out test loss and perplexity
-- 30 deterministic held-out generations on the VM profile, stratified across English, Tamil, Tanglish and Tamil-English mixed conversations
+- 40 deterministic held-out generations on the VM profile (4 on smoke), stratified across English, Tamil, Tanglish and Tamil-English mixed conversations
 - per-generation termination, max-token, latency, throughput and repeated-4-gram metrics
+- per-language termination, max-token, repetition, bucket-presence and script-adherence health gates
+- deterministic data-quality filtering for severe word-level repeated-4-gram responses
+- tokenization/truncation diagnostics without changing the 512-token training default
 - CPU BF16 when the machine supports it
 - gradient accumulation and optional gradient checkpointing
 - timestamped compatible resume
@@ -348,6 +360,14 @@ Prepare and validate the dataset without downloading Qwen:
 SWICO_QWEN_PREPARE_ONLY=true ./run_qwen_training.sh
 ```
 
+Run the tokenizer-only audit (loads the tokenizer, never the model and never trains):
+
+```bash
+SWICO_QWEN_AUDIT_TOKENIZATION=true ./run_qwen_training.sh
+```
+
+The resulting `prepared/data_quality.json` reports excluded conversation IDs and reasons. The default severe threshold is a word-level repeated-4-gram ratio above `0.30`; only clearly pathological conversations are excluded. The tokenizer report includes pre/post lengths, p50/p90/p95/p99, truncation rate, and assistant supervised-token retention by split and language.
+
 ## Qwen smoke test
 
 ```bash
@@ -375,7 +395,7 @@ nohup ./run_qwen_training.sh > qwen-launcher.log 2>&1 &
 The default `vm` profile is intentionally conservative for an 8-logical-CPU / ~29 GiB RAM VM:
 
 ```text
-max conversations = 12000
+max conversations = 12000 (profile default)
 epoch cap = 2
 physical batch = 1
 gradient accumulation = 16
@@ -388,11 +408,19 @@ LoRA alpha = 16
 LoRA dropout = 0.05
 ```
 
-The bundled CSV currently contains 22,854 deduplicated conversations. The VM profile still selects at most 12,000; this is reported as `max_conversations_cap_effective` and `max_conversations_cap_source` in run metadata. Set `SWICO_QWEN_MAX_CONVERSATIONS=22854` explicitly if a run should use the full dataset; this changes the run fingerprint and creates a separate experiment.
+`SWICO_QWEN_MAX_CONVERSATIONS` accepts `auto`, a positive integer, or `all`. `auto` uses the selected profile cap; `all` removes the cap while retaining every other selected-profile setting. The source (`profile default`, `explicit integer`, or `explicit all`) is recorded in metadata and reports. Dataset size is intentionally discovered during preparation rather than hard-coded.
+
+To reproduce an all-conversation run with the successful VM hyperparameters:
+
+```bash
+SWICO_QWEN_RUN_MODE=new SWICO_QWEN_PROFILE=vm SWICO_QWEN_MAX_CONVERSATIONS=all ./run_qwen_training.sh
+```
+
+This keeps 2 epochs, sequence length 512, physical batch 1, gradient accumulation 16, learning rate 5e-5, and the existing LoRA settings. It does not switch to the `full` profile.
 
 Evaluation and saving are step-based and configurable with `SWICO_QWEN_EVAL_STEPS` and `SWICO_QWEN_SAVE_STEPS`. With `load_best_model_at_end=true`, keep save steps a multiple of evaluation steps.
 
-Early stopping can finish before the epoch cap. A final report marks the candidate **UNHEALTHY** if overall termination is below 95% or max-token-hit rate is above 5%; per-language summaries are included as well.
+Generation uses `max_new_tokens=256` by default. A final report preserves overall metrics but marks a candidate unhealthy when any required language bucket is missing or violates configured termination, max-token-hit, repeated-4-gram, or script-adherence thresholds. Health is not a factuality judge; every report contains `manual_quality_review_required: true`.
 
 ## Qwen outputs
 
@@ -404,6 +432,9 @@ training_artifacts/qwen3-0.6b-swico/runs/<timestamp>_<profile>/
   prepared/train.jsonl
   prepared/validation.jsonl
   prepared/test.jsonl
+  prepared/metadata.json
+  prepared/data_quality.json
+  prepared/tokenization_audit.json
   reports/final_report.md
   reports/final_report.json
   run_manifest.json
@@ -413,7 +444,34 @@ training_artifacts/qwen3-0.6b-swico/runs/<timestamp>_<profile>/
   training.log
 ```
 
-By default only the LoRA adapter is exported. This is the recommended CPU-VM behavior because it minimizes disk and memory use. To also create a merged standalone Qwen model after training:
+By default only the LoRA adapter is exported. This is the recommended CPU-VM behavior because it minimizes disk and memory use. To export an existing adapter later, without retraining:
+
+```bash
+python export_qwen_adapter.py \
+  --base-model Qwen/Qwen3-0.6B \
+  --adapter /path/to/existing/models/adapter \
+  --output /path/to/merged-qwen
+```
+
+The command explicitly performs export only. If llama.cpp tools are available, add `--convert-script /path/to/convert_hf_to_gguf.py --gguf-output /path/to/model.gguf`; add `--quantize-binary /path/to/llama-quantize --quantization Q4_K_M` for quantization. No conversion is run by unit tests or normal training.
+
+To compare base Qwen, a candidate adapter, and optionally the current champion on the exact prepared test set:
+
+```bash
+python qwen_compare_models.py \
+  --prepared-test /path/to/run/prepared/test.jsonl \
+  --candidate-adapter /path/to/candidate/models/adapter \
+  --champion-adapter /path/to/current/champion/models/adapter \
+  --output-dir /path/to/comparison-report
+```
+
+Omit `--champion-adapter` when none exists. This loads models sequentially, uses the same deterministic 40-row language-stratified selection, `enable_thinking=False`, `do_sample=False`, and `max_new_tokens=256`, and writes JSON/Markdown with expected, base, adapter, and champion answers plus per-language metrics. Add `--include-loss` for held-out teacher-forced loss/perplexity.
+
+The champion path can also be supplied as `SWICO_QWEN_CHAMPION_ADAPTER=/path/to/adapter`; CLI arguments take precedence in the normal shell workflow.
+
+After a merged or GGUF export, use `qwen_validate_exports.py` with a small multilingual prepared-test sample. It compares adapter-based HF output with merged HF output and, when `--gguf` and `--llama-cli` are supplied, GGUF output. The report makes no parity claim automatically; inspect all answers and metrics.
+
+To also create a merged standalone Qwen model during a new training run (not required for ordinary adapter training):
 
 ```text
 SWICO_QWEN_MERGE_ADAPTER=true
@@ -427,7 +485,7 @@ SWICO_QWEN_RUN_MODE=new SWICO_QWEN_MERGE_ADAPTER=true ./run_qwen_training.sh
 
 The adapter is still exported. Merging temporarily consumes more RAM. The held-out report states whether the evaluated model was adapter-based or merged; the current trainer evaluates the adapter-based model before optional export. Do not assume a merged model is faster—benchmark both models on the target CPU.
 
-Each final report records the dataset SHA, effective conversation cap and counts, sequence length, learning rate, requested/actual epochs, global steps, batch/accumulation settings, LoRA settings, best checkpoint/loss, BF16 state, and merged/unmerged export status.
+Each final report records the dataset SHA, effective conversation cap and provenance, language validation, ta-en normalization, data-quality exclusions, tokenization statistics, generation sample count, `max_new_tokens=256`, health thresholds, best checkpoint/loss, BF16 state, and merged/unmerged export status. Training `status=completed` is separate from candidate/promotion status; a candidate is never automatically promoted or used to overwrite an existing adapter.
 
 ## Which trainer should I run?
 

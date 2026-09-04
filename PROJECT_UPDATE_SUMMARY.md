@@ -1,4 +1,16 @@
-# Qwen CPU LoRA runtime and termination fixes
+# Qwen CPU LoRA runtime and pipeline hardening
+
+The Qwen pipeline now evaluates generation with `max_new_tokens=256` by default: 4 deterministic language-stratified smoke samples and 40 VM samples. The former 128-token setting is retained only as historical context; 384 is not used as a default.
+
+Preparation derives one canonical language from non-system rows, so the English system-row label cannot contaminate language categories. The ta-en system prompt is normalized to Tamil-script-plus-English semantics, Tanglish remains Latin-script Tamil, and script/style checks are recorded.
+
+Preparation audits assistant responses with a conservative word-level repeated-4gram threshold (`>0.30`), excludes only clearly pathological conversations, and writes `prepared/data_quality.json`. User and assistant answer text is never automatically rewritten.
+
+Qwen runs also write tokenizer pre/post length, truncation, and supervised-token retention statistics by language. This is available in tokenizer-only mode and deliberately leaves the training sequence length at 512 pending evidence.
+
+Generation health now requires all four language buckets and checks termination, max-token hits, repetition, and script adherence per bucket. `status=completed` remains a technical training result; candidate promotion is separate and always requires manual quality review.
+
+`qwen_compare_models.py` compares base Qwen, a candidate adapter, and an optional champion adapter on the exact same deterministic prepared test samples without retraining. `export_qwen_adapter.py` merges an existing adapter for deployment, with optional llama.cpp conversion/quantization; `qwen_validate_exports.py` provides local adapter/merged/GGUF parity checks.
 
 This build includes the earlier multi-turn assistant-labeling fix and adds the runtime fix for the latest smoke-training failure:
 
@@ -31,5 +43,5 @@ This prevents the common failure where a good answer is followed by unconstraine
 - Full unit-test suite: run on the target VM after installing `requirements-cpu.txt`.
 - Runtime regression test verifies a BatchEncoding-like object is unpacked to tensors before `model.generate()`.
 - Multi-turn assistant content/end-of-message, system/user masking, thinking-wrapper masking and truncation regressions are covered.
-- VM generation evaluation now uses 30 deterministic language-stratified samples with termination and max-token health thresholds.
+- Historical VM generation evaluation used 30 deterministic language-stratified samples; current default is 40 with per-language health thresholds.
 - Python compilation check passed.
