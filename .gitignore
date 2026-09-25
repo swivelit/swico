@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.hf_cache/
+training_artifacts/
+*.log
+.DS_Store
